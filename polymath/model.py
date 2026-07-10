@@ -348,73 +348,6 @@ class FeedForward(nn.Module):
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
-class MoEFFN(nn.Module):
-    """
-    Sparse Mixture-of-Experts (MoE) FFN with Shared + Routed Experts (DeepSeek-V3 style).
-    Controls computation per token inside recurrent loop iterations.
-    Includes load-balancing auxiliary loss to prevent expert collapse.
-    """
-    def __init__(self, d_model: int, d_ff: int, n_experts: int = 4, n_experts_per_tok: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.n_experts = n_experts
-        self.n_experts_per_tok = min(n_experts_per_tok, n_experts)
-
-        # 1 Shared Expert (always active for every token)
-        self.shared_expert = FeedForward(d_model, d_ff, dropout=dropout)
-
-        # N Routed Experts (smaller dimension per expert so top-k computation matches standard FFN budget)
-        expert_d_ff = max(64, d_ff // n_experts_per_tok)
-        self.routed_experts = nn.ModuleList([
-            FeedForward(d_model, expert_d_ff, dropout=dropout) for _ in range(n_experts)
-        ])
-        self.router = nn.Linear(d_model, n_experts, bias=False)
-        self.aux_loss: torch.Tensor = torch.tensor(0.0)
-
-    def _compute_aux_loss(self, gate_probs: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Switch Transformer load-balancing loss:
-        L_aux = n_experts * sum_i(f_i * P_i)
-        where f_i = fraction of tokens dispatched to expert i
-              P_i = mean gate probability for expert i across all tokens
-        """
-        n_tokens = gate_probs.shape[0]
-        one_hot = F.one_hot(indices, num_classes=self.n_experts).float()  # [n_tokens, k, n_experts]
-        f = one_hot.sum(dim=1).sum(dim=0) / max(n_tokens, 1)  # [n_experts]
-        P = gate_probs.mean(dim=0)  # [n_experts]
-        return self.n_experts * (f * P).sum()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Shared expert pathway
-        shared_out = self.shared_expert(x)
-
-        # Routed experts gating
-        gate_logits = self.router(x)  # [B, T, n_experts]
-        gate_probs = torch.softmax(gate_logits, dim=-1)
-        weights, indices = torch.topk(gate_probs, k=self.n_experts_per_tok, dim=-1)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)  # re-normalize top-k weights
-
-        # Compute auxiliary loss for load balancing
-        B, T, _ = x.shape
-        flat_probs = gate_probs.view(-1, self.n_experts)
-        flat_indices = indices.view(-1, self.n_experts_per_tok)
-        self.aux_loss = self._compute_aux_loss(flat_probs, flat_indices)
-
-        # Dispatch and combine top-k expert outputs
-        flat_x = x.view(-1, self.router.in_features)
-        flat_weights = weights.view(-1, self.n_experts_per_tok)
-        flat_out = torch.zeros_like(flat_x)
-
-        for i, expert in enumerate(self.routed_experts):
-            mask = (flat_indices == i)
-            if not mask.any():
-                continue
-            token_idx, rank_idx = mask.nonzero(as_tuple=True)
-            expert_in = flat_x[token_idx]
-            expert_out = expert(expert_in)
-            flat_out.index_add_(0, token_idx, (expert_out * flat_weights[token_idx, rank_idx].unsqueeze(-1)).to(flat_out.dtype))
-
-        routed_out = flat_out.view(B, T, -1)
-        return shared_out + routed_out
 
 
 # ==========================================
@@ -547,17 +480,8 @@ class TransformerDecoderBlock(nn.Module):
                 qk_norm=config.qk_norm
             )
 
-        # FFN selection
-        if getattr(config, "ffn_type", "swiglu").lower() == "moe":
-            self.ffn = MoEFFN(
-                d_model=config.d_model,
-                d_ff=d_ff,
-                n_experts=config.n_experts,
-                n_experts_per_tok=config.n_experts_per_tok,
-                dropout=config.dropout
-            )
-        else:
-            self.ffn = FeedForward(config.d_model, d_ff, dropout=config.dropout)
+        # FFN
+        self.ffn = FeedForward(config.d_model, d_ff, dropout=config.dropout)
 
         self.norm1 = RMSNorm(config.d_model)
         self.norm2 = RMSNorm(config.d_model)
@@ -693,7 +617,7 @@ class TransformerLM(nn.Module):
         self.tok_emb.weight = self.lm_head.weight
 
         self.use_activation_checkpointing = False
-        self.aux_loss = torch.tensor(0.0)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -818,13 +742,7 @@ class TransformerLM(nn.Module):
                 self._cached_sources = sources
             out = self.norm(state)
 
-        # Collect MoE auxiliary losses across blocks
-        self.aux_loss = torch.tensor(0.0, device=idx.device)
-        if getattr(self.config, 'ffn_type', 'swiglu').lower() == 'moe':
-            blocks_to_check = (list(self.prelude) + [self.recurrent.block] + list(self.coda)) if self.mode in ['openmythos_rdt', 'polymath'] else list(self.blocks)
-            for block in blocks_to_check:
-                if hasattr(block, 'ffn') and hasattr(block.ffn, 'aux_loss'):
-                    self.aux_loss = self.aux_loss + block.ffn.aux_loss
+
 
         logits = self.lm_head(out)
         if use_cache:

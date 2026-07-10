@@ -3,7 +3,7 @@ model:
   d_model: 2048
   n_heads: 32
   n_kv_heads: 8
-  d_ff: 5632
+  d_ff: 11264
   max_seq_len: 4096
   rope_theta: 500000.0
   mode: polymath
@@ -11,10 +11,7 @@ model:
   attn_type: mla
   kv_lora_rank: 256
   qk_rope_head_dim: 64
-  ffn_type: moe
-  n_experts: 8
-  n_experts_per_tok: 2
-  moe_aux_loss_coeff: 0.01
+
   prelude_layers: 3
   coda_layers: 3
   max_loop_iters: 10

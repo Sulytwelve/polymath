@@ -23,10 +23,7 @@ class ModelConfig:
     attn_type: str = "gqa"       # "gqa" or "mla" (Multi-Latent Attention)
     kv_lora_rank: int = 64       # Latent KV compression rank when attn_type == "mla"
     qk_rope_head_dim: int = 32   # Decoupled RoPE head dim when attn_type == "mla"
-    ffn_type: str = "swiglu"     # "swiglu" or "moe" (Sparse Mixture of Experts)
-    n_experts: int = 4           # Total routed experts for MoEFFN
-    n_experts_per_tok: int = 2   # Top-k routed experts per token for MoEFFN
-    moe_aux_loss_coeff: float = 0.01  # Coefficient for MoE load-balancing auxiliary loss
+
     prelude_layers: int = 1      # Number of prelude transformer blocks when mode in ("polymath", "openmythos_rdt")
     coda_layers: int = 1         # Number of coda transformer blocks when mode in ("polymath", "openmythos_rdt")
     max_loop_iters: int = 6      # Max loop iterations T for recurrent block when mode in ("polymath", "openmythos_rdt")
@@ -43,7 +40,6 @@ class ModelConfig:
         valid_modes = {"polymath", "standard", "attn_res", "delta_attn_res", "openmythos_rdt"}
         assert self.mode.lower() in valid_modes, f"Invalid mode '{self.mode}'. Must be one of: {valid_modes}"
         assert self.attn_type.lower() in {"gqa", "mla"}, f"Invalid attn_type '{self.attn_type}'"
-        assert self.ffn_type.lower() in {"swiglu", "moe"}, f"Invalid ffn_type '{self.ffn_type}'"
 
 @dataclass
 class TrainConfig:

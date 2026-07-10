@@ -11,7 +11,6 @@ model:
   attn_type: mla
   kv_lora_rank: 128
   qk_rope_head_dim: 32
-  ffn_type: standard
   prelude_layers: 2
   coda_layers: 2
   max_loop_iters: 6
