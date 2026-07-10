@@ -1,40 +1,38 @@
 model:
-  d_model: 288
-  n_heads: 6
-  n_kv_heads: 6
-  d_ff: 768
-  n_layers: 4  # NOTE: unused in polymath mode (uses prelude_layers + 1 recurrent + coda_layers)
+  d_model: 512
+  n_heads: 8
+  n_kv_heads: 4
+  d_ff: 2048
+  n_layers: 6
   max_seq_len: 256
   rope_theta: 10000.0
   mode: polymath
   attn_res_mode: full
   attn_type: mla
-  kv_lora_rank: 64
+  kv_lora_rank: 128
   qk_rope_head_dim: 32
-  ffn_type: moe
-  n_experts: 4
-  n_experts_per_tok: 2
-  prelude_layers: 1
-  coda_layers: 1
+  ffn_type: standard
+  prelude_layers: 2
+  coda_layers: 2
   max_loop_iters: 6
   uniform_loop_sampling: true
-  lora_rank: 16
+  lora_rank: 32
   qk_norm: true
   dropout: 0.0
 
 train:
-  batch_size: 8
-  gradient_accumulation_steps: 1
-  max_iters: 200
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  max_iters: 1000
   lr: 0.001
   min_lr: 0.0001
-  warmup_iters: 50
+  warmup_iters: 100
   weight_decay: 0.1
   grad_clip: 1.0
   use_amp: true
-  eval_interval: 50
+  eval_interval: 200
   eval_iters: 10
-  log_interval: 5
+  log_interval: 10
   checkpoint_dir: checkpoints
 
 tokenizer:
