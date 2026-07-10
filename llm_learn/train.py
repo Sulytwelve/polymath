@@ -126,7 +126,11 @@ def estimate_loss(model: nn.Module, train_dataset, val_dataset, config: Config, 
 def main():
     parser = argparse.ArgumentParser(description="Production-grade Training Loop for <=2B Autoregressive Transformer Models.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file (e.g. configs/tiny.yaml).")
-    parser.add_argument("--mode", type=str, default=None, choices=["standard", "attn_res", "delta_attn_res", "mhc"], help="Override model routing mode.")
+    parser.add_argument("--mode", type=str, default=None, choices=["standard", "attn_res", "delta_attn_res", "mhc", "openmythos_rdt"], help="Override model routing mode.")
+    parser.add_argument("--attn_type", type=str, default=None, choices=["gqa", "mla"], help="Override attention mechanism (GQA vs Multi-Latent Attention).")
+    parser.add_argument("--ffn_type", type=str, default=None, choices=["swiglu", "moe"], help="Override feed-forward block type (SwiGLU vs Sparse MoE).")
+    parser.add_argument("--max_loop_iters", type=int, default=None, help="Override max loop iterations for openmythos_rdt.")
+    parser.add_argument("--n_experts", type=int, default=None, help="Override routed experts count when ffn_type is moe.")
     parser.add_argument("--iters", type=int, default=None, help="Override training iterations.")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size.")
@@ -273,7 +277,12 @@ def main():
             t0 = t1
             tokens_processed = config.train.batch_size * config.train.gradient_accumulation_steps * config.model.max_seq_len * ddp_world_size
             tokens_per_sec = tokens_processed / max(dt, 1e-5) if step > start_step else 0.0
-            print(f"Step {step:5d}/{config.train.max_iters} | LR: {lr:.6f} | Loss: {accum_loss:.4f} | Throughput: {tokens_per_sec:,.0f} tokens/s")
+            rho_str = ""
+            if config.model.mode.lower() == "openmythos_rdt":
+                rho = raw_model.get_spectral_radius()
+                if rho is not None:
+                    rho_str = f" | rho(A): {rho:.4f}"
+            print(f"Step {step:5d}/{config.train.max_iters} | LR: {lr:.6f} | Loss: {accum_loss:.4f}{rho_str} | Throughput: {tokens_per_sec:,.0f} tokens/s")
 
         # Evaluation & Checkpoint Saving
         if step % config.train.eval_interval == 0 or step == config.train.max_iters:

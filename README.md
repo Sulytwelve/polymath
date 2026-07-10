@@ -2,7 +2,7 @@
 
 `LLM-learn` is a modular, engineering-focused PyTorch repository designed for training small-to-medium Autoregressive Decoder-only Transformers (**up to 2B parameters**).
 
-It serves both as a pedagogical sandbox and an experimental framework for comparing **four advanced architectural routing variants** (`standard`, `attn_res`, `delta_attn_res`, `mhc`) alongside modern LLM components like **RoPE**, **GQA**, **QK-Norm**, and **KV-Cache**.
+It serves both as a pedagogical sandbox and an experimental framework for comparing **five advanced architectural routing variants** (`standard`, `attn_res`, `delta_attn_res`, `mhc`, `openmythos_rdt`) alongside modern LLM components like **RoPE**, **GQA/MLA**, **QK-Norm**, **MoE FFN**, and **KV-Cache**.
 
 ---
 
@@ -10,15 +10,16 @@ It serves both as a pedagogical sandbox and an experimental framework for compar
 
 - **Modern Model Architecture (`llm_learn/model.py`)**:
   - **Rotary Position Embedding (RoPE):** Relative positional encoding supporting long-context extrapolation.
-  - **Grouped Query Attention (GQA):** Configurable K/V heads (`n_kv_heads`) to minimize memory bandwidth and KV-Cache footprint.
-  - **QK-Norm & SwiGLU FFN:** Pre-attention Q/K RMSNorm for logit stability and gated SwiGLU non-linearities.
-  - **KV-Cache Incremental Decoding:** Fast $O(1)$ per-token generation in `sample.py`.
+  - **Grouped Query & Multi-Latent Attention (GQA / MLA):** Configurable K/V heads (`n_kv_heads`) or low-rank joint KV compression (`kv_lora_rank`) to minimize memory bandwidth and KV-Cache footprint.
+  - **QK-Norm, SwiGLU & Sparse MoE FFN:** Pre-attention Q/K RMSNorm, SwiGLU non-linearities, and routed top-k Mixture-of-Experts (`MoEFFN`).
+  - **KV-Cache Incremental Decoding:** Fast $O(1)$ per-token generation in `sample.py` (`--effort` adaptive depth).
 
-- **Four Inter-Layer Routing Variants**:
+- **Five Inter-Layer Routing & Structural Variants**:
   1. `standard`: Traditional PreNorm additive connections.
   2. `attn_res`: Kimi/Moonshot AI Attention Residuals (arXiv:2603.15031).
   3. `delta_attn_res`: May 2026 sparse delta attention routing (arXiv:2605.18855).
   4. `mhc`: DeepSeek Manifold-Constrained Hyper-Connections with Sinkhorn-Knopp projection (arXiv:2512.24880).
+  5. `openmythos_rdt`: OpenMythos / Fable 5 Recurrent-Depth Transformer (`Prelude->Recurrent->Coda`) with Depth-wise LoRA and guaranteed contraction mapping spectral radius ($\rho(A) < 1$).
 
 - **Production Engineering (`llm_learn/train.py` & `llm_learn/prepare_data.py`)**:
   - **YAML Configuration System (`configs/*.yaml`)**: Clean, reproducible experiments (`tiny`, `small`, `medium`, `large`).

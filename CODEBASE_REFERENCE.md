@@ -53,6 +53,20 @@ This document provides a comprehensive guide to the `llm_learn` codebase for dev
   $$H_l^{res\_mixed} = (1 - \alpha_l) I + \alpha_l S_l$$
 * **Characteristics:** $S_l$ is projected onto the **Birkhoff Polytope** (doubly stochastic matrices) using the iterative **Sinkhorn-Knopp** algorithm. Because doubly stochastic matrices are non-expansive (spectral radius $\le 1$), this guarantees training stability across ultra-deep architectures without residual explosions.
 
+#### Mode 5: OpenMythos Recurrent-Depth Transformer (`openmythos_rdt`)
+* **Source:** OpenMythos / Fable 5 Reverse Engineering & Academic Literature (Saunshi et al., 2025; arXiv:2604.07822; DeepSeek-V2/V3).
+* **Formula:** Organizes the architecture into a three-stage pipeline (`Prelude -> RecurrentBlock -> Coda`). The recurrent block shares a single Transformer layer weight and loops iteratively $T$ times (`max_loop_iters`):
+  $$e = \text{Prelude}(h_0), \quad h_{(0)} = e$$
+  $$\Delta h_t = \text{TransformerBlock}(h_t, \text{past\_kv}) + \text{DepthWiseLoRA}(t, h_t)$$
+  $$h_{t+1} = A \cdot h_t + B \cdot e + \Delta h_t$$
+  $$\text{Out} = \text{Coda}(h_{(T)})$$
+* **Characteristics & Critical Features:**
+  * **Multi-Latent Attention (MLA):** When `attn_type="mla"`, compresses Key/Value representations into a low-rank latent vector $c_{KV} = W_{DKV}(x) \in \mathbb{R}^{kv\_lora\_rank}$ alongside decoupled RoPE query/key branches ($q_{pe}, k_{pe} \in \mathbb{R}^{qk\_rope\_head\_dim}$). This cuts KV-cache bandwidth requirements by $>80\%$.
+  * **Sparse Mixture of Experts (`MoEFFN`):** When `ffn_type="moe"`, combines 1 always-active Shared Expert (`shared_expert`) with $N$ routed experts (`routed_experts`), activating only the top-$k$ (`n_experts_per_tok`) experts per token via gating probabilities.
+  * **Depth-Wise LoRA Perturbation (`DepthWiseLoRA`):** Injects step-conditioned low-rank matrices across loop iterations $t \in [0, T-1]$, preventing loop homogenization while maintaining weight-sharing efficiency.
+  * **Spectral Radius Stability ($\rho(A) < 1$):** Parameterizes the recurrent contraction matrix $A$ as $A = \text{diag}(\exp(-\text{softplus}(A\_raw)))$. This strictly bounds $\rho(A) \in (0, 1)$, ensuring the LTI recurrence is a contraction mapping that never suffers from hidden-state explosion across arbitrary loop depths.
+  * **Adaptive Computation Depth (`--effort`):** Allows dynamic adjustment of loop iterations during generation (`sample.py --effort low|medium|high|xhigh`), giving the model adaptive thinking depth without retraining.
+
 ---
 
 ## 2. Directory & File Map
@@ -65,16 +79,18 @@ LLM-learn/
 │   ├── tiny.yaml               # (~15M params) Debug / fast CPU verification
 │   ├── small.yaml              # (~125M params) GPT-3 Small class
 │   ├── medium.yaml             # (~350M params) GPT-3 Medium class
-│   └── large.yaml              # (~1.5B params) Production <2B model
+│   ├── large.yaml              # (~1.5B params) Production <2B model
+│   ├── openmythos_tiny.yaml    # (~7.2M params) OpenMythos RDT + MLA + MoE (CPU fast check)
+│   └── openmythos_small.yaml   # (~65M params) OpenMythos RDT + MLA + MoE (Production RDT check)
 └── llm_learn/
     ├── __init__.py
     ├── config.py               # Structured dataclasses (ModelConfig, TrainConfig, DataConfig)
     ├── tokenizer.py            # Unified Tokenizer API (CharTokenizer vs Tiktoken BPE)
     ├── prepare_data.py         # mmap binary dataset serializer (train.bin, val.bin)
     ├── dataset.py              # CharDataset & MmapDataset + PyTorch DataLoader integration
-    ├── model.py                # TransformerLM, RoPE, GQA, QK-Norm, KV-Cache, 4 routing modes
+    ├── model.py                # TransformerLM, RoPE, GQA/MLA, QK-Norm, KV-Cache, MoEFFN, 5 routing modes
     ├── train.py                # Distributed training loop (AMP, DDP, GradAccum, GradClip, Resume)
-    └── sample.py               # Autoregressive sampling script with fast KV-Cache support
+    └── sample.py               # Autoregressive sampling script (`--effort` adaptive depth)
 ```
 
 ---
@@ -94,10 +110,14 @@ PYTHONPATH=llm_learn uv run python llm_learn/prepare_data.py --input_file corpus
 * **Automatic Mixed Precision (`use_amp`):** BF16 / FP16 `autocast` with `GradScaler`
 * **Distributed Data Parallel (`DDP`):** Multi-GPU training via `torchrun`
 * **Checkpoint Resumption (`--resume`):** Restores model weights, optimizer states, schedule step, and random number generator state.
+* **Spectral Radius Monitoring (`rho(A)`):** Automatically monitors internal LTI contraction mapping stability when in `openmythos_rdt` mode.
 
 ```bash
 # Train using a preset YAML configuration on single GPU or CPU
 PYTHONPATH=llm_learn uv run python llm_learn/train.py --config configs/small.yaml
+
+# Train an OpenMythos Recurrent-Depth Transformer with Multi-Latent Attention and MoE
+PYTHONPATH=llm_learn uv run python llm_learn/train.py --config configs/openmythos_tiny.yaml
 
 # Override model routing mode and training iterations from CLI
 PYTHONPATH=llm_learn uv run python llm_learn/train.py --config configs/small.yaml --mode delta_attn_res --iters 5000
@@ -107,9 +127,9 @@ PYTHONPATH=llm_learn torchrun --nproc_per_node=4 llm_learn/train.py --config con
 ```
 
 ### Step 3: Autoregressive Sampling (`sample.py`)
-`sample.py` reads a saved checkpoint, automatically rebuilds the exact architecture configuration and tokenizer, and generates text using $O(1)$ step KV-Cache decoding:
+`sample.py` reads a saved checkpoint, automatically rebuilds the exact architecture configuration and tokenizer, and generates text using $O(1)$ step KV-Cache decoding and `--effort` adaptive computation depth:
 ```bash
-PYTHONPATH=llm_learn uv run python llm_learn/sample.py --checkpoint checkpoints/model_standard.pt --prompt "Once upon a time" --num_tokens 300 --temp 0.8 --top_k 50
+PYTHONPATH=llm_learn uv run python llm_learn/sample.py --checkpoint checkpoints/model_openmythos_rdt.pt --prompt "Once upon a time" --num_tokens 300 --temp 0.8 --effort high
 ```
 
 ---
@@ -123,7 +143,12 @@ PYTHONPATH=llm_learn uv run python llm_learn/sample.py --checkpoint checkpoints/
 | `model.n_kv_heads` | `int` | `4` | Number of key/value heads for GQA |
 | `model.max_seq_len` | `int` | `1024` | Maximum context window size |
 | `model.rope_theta` | `float` | `10000.0` | Rotary frequency base parameter (`10000.0` to `500000.0`) |
-| `model.mode` | `str` | `"standard"` | Routing mode: `standard`, `attn_res`, `delta_attn_res`, `mhc` |
+| `model.mode` | `str` | `"standard"` | Routing mode: `standard`, `attn_res`, `delta_attn_res`, `mhc`, `openmythos_rdt` |
+| `model.attn_type` | `str` | `"gqa"` | Attention type: `gqa` (Grouped Query) or `mla` (Multi-Latent Attention) |
+| `model.kv_lora_rank` | `int` | `64` | Latent KV compression rank when `attn_type="mla"` |
+| `model.ffn_type` | `str` | `"swiglu"` | FFN block type: `swiglu` or `moe` (Sparse Mixture-of-Experts) |
+| `model.n_experts` | `int` | `4` | Number of routed experts in `MoEFFN` |
+| `model.max_loop_iters` | `int` | `6` | Default loop count $T$ for `openmythos_rdt` mode |
 | `model.qk_norm` | `bool` | `True` | Apply RMSNorm to Q and K before dot product |
 | `train.batch_size` | `int` | `32` | Batch size per GPU / worker |
 | `train.gradient_accumulation_steps` | `int` | `4` | Number of micro-steps before optimizer update |

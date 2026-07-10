@@ -1,0 +1,45 @@
+model:
+  d_model: 288
+  n_heads: 6
+  n_kv_heads: 6
+  d_ff: 768
+  n_layers: 4
+  max_seq_len: 256
+  rope_theta: 10000.0
+  mode: openmythos_rdt
+  attn_type: mla
+  kv_lora_rank: 64
+  qk_rope_head_dim: 32
+  ffn_type: moe
+  n_experts: 4
+  n_experts_per_tok: 2
+  prelude_layers: 1
+  coda_layers: 1
+  max_loop_iters: 6
+  uniform_loop_sampling: true
+  lora_rank: 16
+  qk_norm: true
+  dropout: 0.0
+
+train:
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  max_iters: 500
+  lr: 0.0005
+  min_lr: 0.00005
+  warmup_iters: 50
+  weight_decay: 0.01
+  grad_clip: 1.0
+  use_amp: true
+  eval_interval: 100
+  eval_iters: 10
+  log_interval: 10
+  checkpoint_dir: checkpoints
+
+tokenizer:
+  tokenizer_type: char
+  tiktoken_encoding: cl100k_base
+
+data:
+  dataset_type: char_memory
+  input_file: null

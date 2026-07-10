@@ -13,13 +13,26 @@ class ModelConfig:
     vocab_size: int = 100277     # Default for tiktoken cl100k_base (or set dynamically by CharDataset)
     max_seq_len: int = 512       # Maximum sequence length / context window
     rope_theta: float = 10000.0  # Rotary position embedding base frequency
-    mode: str = "standard"       # "standard", "attn_res", "delta_attn_res", "mhc"
+    mode: str = "standard"       # "standard", "attn_res", "delta_attn_res", "mhc", "openmythos_rdt"
     n_streams: int = 4           # For mHC mode
     sinkhorn_iters: int = 10     # For mHC mode
     attn_res_mode: str = "full"  # "full" or "block" for attn_res
     block_size_layers: int = 2   # Number of layers per block when attn_res_mode == "block"
     dropout: float = 0.0
     qk_norm: bool = True         # Apply RMSNorm to Q and K before attention dot product
+
+    # New options for OpenMythos RDT / Fable 5 reverse engineering
+    attn_type: str = "gqa"       # "gqa" or "mla" (Multi-Latent Attention)
+    kv_lora_rank: int = 64       # Latent KV compression rank when attn_type == "mla"
+    qk_rope_head_dim: int = 32   # Decoupled RoPE head dim when attn_type == "mla"
+    ffn_type: str = "swiglu"     # "swiglu" or "moe" (Sparse Mixture of Experts)
+    n_experts: int = 4           # Total routed experts for MoEFFN
+    n_experts_per_tok: int = 2   # Top-k routed experts per token for MoEFFN
+    prelude_layers: int = 1      # Number of prelude transformer blocks when mode == "openmythos_rdt"
+    coda_layers: int = 1         # Number of coda transformer blocks when mode == "openmythos_rdt"
+    max_loop_iters: int = 6      # Max loop iterations T for recurrent block when mode == "openmythos_rdt"
+    uniform_loop_sampling: bool = True  # Uniformly sample T in [1, max_loop_iters] during training
+    lora_rank: int = 16          # Depth-wise LoRA rank injected across loop iterations
 
     def __post_init__(self):
         if self.d_ff is None:

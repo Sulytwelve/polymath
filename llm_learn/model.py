@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Any
 from config import ModelConfig
 
 # ==========================================
@@ -144,7 +144,7 @@ def sinkhorn_knopp_projection(logits: torch.Tensor, max_iter: int = 20, eps: flo
 
 
 # ==========================================
-# 5. Standard Sub-layers (GQA Causal Attention & SwiGLU FFN)
+# 5. Attention Modules: GQA & Multi-Latent Attention (MLA)
 # ==========================================
 
 class CausalSelfAttention(nn.Module):
@@ -218,7 +218,6 @@ class CausalSelfAttention(nn.Module):
                 is_causal=is_causal
             )
         else:
-            # Fallback for older PyTorch versions
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if is_causal:
                 mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
@@ -232,9 +231,121 @@ class CausalSelfAttention(nn.Module):
         return out, present_key_value
 
 
+class MultiLatentAttention(nn.Module):
+    """
+    DeepSeek-V2 style Multi-Latent Attention (MLA).
+    Uses low-rank joint KV compression (`kv_lora_rank`) and decoupled RoPE (`qk_rope_head_dim`)
+    to drastically compress KV-cache memory bandwidth during autoregressive loops and generation.
+    """
+    def __init__(self, d_model: int, n_heads: int, kv_lora_rank: int = 64, qk_rope_head_dim: int = 32,
+                 max_seq_len: int = 2048, rope_theta: float = 10000.0, dropout: float = 0.0, qk_norm: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+
+        # Down-projection for KV latent compression
+        self.dkv_proj = nn.Linear(d_model, kv_lora_rank, bias=False)
+        self.dkv_norm = RMSNorm(kv_lora_rank) if qk_norm else nn.Identity()
+
+        # Up-projection from compressed latent vector c_KV to content Key & Value
+        self.uk_proj = nn.Linear(kv_lora_rank, n_heads * self.head_dim, bias=False)
+        self.uv_proj = nn.Linear(kv_lora_rank, n_heads * self.head_dim, bias=False)
+
+        # Content Query projection
+        self.q_content_proj = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+
+        # Decoupled RoPE Query & Key projections (positional branch)
+        self.q_pe_proj = nn.Linear(d_model, n_heads * qk_rope_head_dim, bias=False)
+        self.k_pe_proj = nn.Linear(d_model, qk_rope_head_dim, bias=False)
+
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        self.qk_norm = qk_norm
+
+        self.out_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        self.rotary_emb = RotaryEmbedding(qk_rope_head_dim, max_position_embeddings=max_seq_len, base=rope_theta)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        B, T, _ = x.shape
+        past_kv_len = past_key_value[0].shape[2] if past_key_value is not None else 0
+        total_len = past_kv_len + T
+
+        # 1. Content query
+        q_content = self.q_content_proj(x).view(B, T, self.n_heads, self.head_dim)
+        if self.qk_norm:
+            q_content = self.q_norm(q_content)
+
+        # 2. Down-project input to latent c_KV, then up-project to K_content and V_content
+        c_kv = self.dkv_norm(self.dkv_proj(x))  # [B, T, kv_lora_rank]
+        k_content = self.uk_proj(c_kv).view(B, T, self.n_heads, self.head_dim)
+        v_content = self.uv_proj(c_kv).view(B, T, self.n_heads, self.head_dim)
+        if self.qk_norm:
+            k_content = self.k_norm(k_content)
+
+        # 3. Decoupled RoPE branch
+        q_pe = self.q_pe_proj(x).view(B, T, self.n_heads, self.qk_rope_head_dim)
+        k_pe = self.k_pe_proj(x).view(B, T, 1, self.qk_rope_head_dim)
+
+        q_pe = q_pe.transpose(1, 2)      # [B, n_heads, T, qk_rope_head_dim]
+        k_pe = k_pe.transpose(1, 2)      # [B, 1, T, qk_rope_head_dim]
+        cos, sin = self.rotary_emb(k_pe, seq_len=total_len)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, past_key_value_length=past_kv_len)
+
+        # Expand k_pe across all n_heads
+        k_pe = k_pe.expand(B, self.n_heads, T, self.qk_rope_head_dim)
+
+        # Transpose content terms
+        q_content = q_content.transpose(1, 2)  # [B, n_heads, T, head_dim]
+        k_content = k_content.transpose(1, 2)  # [B, n_heads, T, head_dim]
+        v = v_content.transpose(1, 2)          # [B, n_heads, T, head_dim]
+
+        # Concatenate content and RoPE dimensions for Q and K
+        q = torch.cat([q_content, q_pe], dim=-1)  # [B, n_heads, T, head_dim + qk_rope_head_dim]
+        k = torch.cat([k_content, k_pe], dim=-1)  # [B, n_heads, T, head_dim + qk_rope_head_dim]
+
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=2)
+            v = torch.cat([past_key_value[1], v], dim=2)
+
+        present_key_value = (k, v) if use_cache else None
+
+        is_causal = (past_key_value is None and T > 1)
+        full_head_dim = self.head_dim + self.qk_rope_head_dim
+        if hasattr(F, "scaled_dot_product_attention"):
+            context = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=is_causal
+            )
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(full_head_dim)
+            if is_causal:
+                mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+                scores = scores.masked_fill(mask, float('-inf'))
+            weights = F.softmax(scores, dim=-1)
+            weights = self.attn_dropout(weights)
+            context = torch.matmul(weights, v)
+
+        context = context.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.head_dim)
+        out = self.resid_dropout(self.out_proj(context))
+        return out, present_key_value
+
+
+# ==========================================
+# 6. Feed-Forward Networks: SwiGLU & Sparse MoE
+# ==========================================
+
 class FeedForward(nn.Module):
     """
-    SwiGLU Feed-Forward Network.
+    Standard SwiGLU Feed-Forward Network.
     """
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
@@ -247,14 +358,138 @@ class FeedForward(nn.Module):
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
+class MoEFFN(nn.Module):
+    """
+    Sparse Mixture-of-Experts (MoE) FFN with Shared + Routed Experts (DeepSeek-V3 style).
+    Controls computation per token inside recurrent loop iterations.
+    """
+    def __init__(self, d_model: int, d_ff: int, n_experts: int = 4, n_experts_per_tok: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.n_experts = n_experts
+        self.n_experts_per_tok = min(n_experts_per_tok, n_experts)
+
+        # 1 Shared Expert (always active for every token)
+        self.shared_expert = FeedForward(d_model, d_ff, dropout=dropout)
+
+        # N Routed Experts (smaller dimension per expert so top-k computation matches standard FFN budget)
+        expert_d_ff = max(64, d_ff // n_experts_per_tok)
+        self.routed_experts = nn.ModuleList([
+            FeedForward(d_model, expert_d_ff, dropout=dropout) for _ in range(n_experts)
+        ])
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Shared expert pathway
+        shared_out = self.shared_expert(x)
+
+        # Routed experts gating
+        gate_logits = self.router(x)  # [B, T, n_experts]
+        weights, indices = torch.topk(torch.softmax(gate_logits, dim=-1), k=self.n_experts_per_tok, dim=-1)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)  # re-normalize top-k weights
+
+        # Dispatch and combine top-k expert outputs
+        routed_out = torch.zeros_like(x)
+        B, T, _ = x.shape
+        flat_x = x.view(-1, self.router.in_features)
+        flat_indices = indices.view(-1, self.n_experts_per_tok)
+        flat_weights = weights.view(-1, self.n_experts_per_tok)
+        flat_out = torch.zeros_like(flat_x)
+
+        for i, expert in enumerate(self.routed_experts):
+            mask = (flat_indices == i)
+            if not mask.any():
+                continue
+            token_idx, rank_idx = mask.nonzero(as_tuple=True)
+            expert_in = flat_x[token_idx]
+            expert_out = expert(expert_in)
+            flat_out.index_add_(0, token_idx, expert_out * flat_weights[token_idx, rank_idx].unsqueeze(-1))
+
+        routed_out = flat_out.view(B, T, -1)
+        return shared_out + routed_out
+
+
 # ==========================================
-# 6. Modular Transformer Decoder Block
+# 7. Depth-wise LoRA & Recurrent Block (OpenMythos RDT / Fable 5)
+# ==========================================
+
+class DepthWiseLoRA(nn.Module):
+    """
+    Loop-conditioned Depth-wise LoRA perturbation.
+    Injected into the weight-shared Recurrent Block at step t so each loop iteration
+    operates with a slightly distinct transformation profile (preventing loop homogenization).
+    """
+    def __init__(self, d_model: int, lora_rank: int = 16, max_loops: int = 32):
+        super().__init__()
+        self.lora_rank = lora_rank
+        self.max_loops = max_loops
+        self.lora_down = nn.Parameter(torch.randn(max_loops, d_model, lora_rank) * 0.02)
+        self.lora_up = nn.Parameter(torch.zeros(max_loops, lora_rank, d_model))
+
+    def forward(self, loop_idx: int, x: torch.Tensor) -> torch.Tensor:
+        idx = min(loop_idx, self.max_loops - 1)
+        down = torch.matmul(x, self.lora_down[idx])
+        up = torch.matmul(down, self.lora_up[idx])
+        return up
+
+
+class RecurrentBlock(nn.Module):
+    """
+    Recurrent-Depth Transformer (RDT) Block for OpenMythos / Fable 5 architecture.
+    Applies a weight-shared Transformer block iteratively T times with:
+    1. Continuous input injection `e` at every step.
+    2. Depth-wise LoRA perturbation per loop iteration.
+    3. Spectral Radius stability constraint (`rho(A) < 1`) via exponential negative softplus diagonal.
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.block = TransformerDecoderBlock(config)
+        self.max_loop_iters = config.max_loop_iters
+        self.d_model = config.d_model
+
+        # Parameterize stable diagonal contraction matrix A: diag(exp(-softplus(A_raw)))
+        self.A_diag_raw = nn.Parameter(torch.ones(config.d_model) * 0.5)
+        # Input injection matrix B
+        self.B_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        # Loop-conditioned LoRA
+        self.lora_per_loop = DepthWiseLoRA(config.d_model, lora_rank=config.lora_rank, max_loops=max(32, config.max_loop_iters))
+
+    def get_A_diag(self) -> torch.Tensor:
+        """Returns the strictly bounded diagonal matrix entries in (0, 1) guaranteeing contraction."""
+        return torch.exp(-F.softplus(self.A_diag_raw))
+
+    def get_spectral_radius(self) -> float:
+        """Computes current spectral radius rho(A). Guaranteed < 1.0."""
+        return self.get_A_diag().max().item()
+
+    def forward(self, h: torch.Tensor, e: torch.Tensor, n_loops: int,
+                past_key_value: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        present_kvs = [] if use_cache else None
+        A = self.get_A_diag().view(1, 1, -1)
+        B_e = self.B_proj(e)
+
+        for t in range(n_loops):
+            past_kv = past_key_value[t] if past_key_value is not None and t < len(past_key_value) else None
+            delta, _, present_kv = self.block(h, past_key_value=past_kv, use_cache=use_cache)
+            if use_cache:
+                present_kvs.append(present_kv)
+
+            # Add loop-conditioned LoRA perturbation
+            delta = delta + self.lora_per_loop(t, h)
+            # Stable LTI recurrence update: h_{t+1} = A * h_t + B * e + delta
+            h = (h * A) + B_e + delta
+
+        return h, present_kvs
+
+
+# ==========================================
+# 8. Modular Transformer Decoder Block
 # ==========================================
 
 class TransformerDecoderBlock(nn.Module):
     """
-    Modular Transformer Block supporting standard PreNorm residual connections,
-    Attention Residuals (AttnRes), and Manifold-Constrained Hyper-Connections (mHC).
+    Modular Transformer Block supporting standard PreNorm residuals, AttnRes, mHC, and OpenMythos RDT.
+    Dynamically routes between GQA / MLA attention and SwiGLU / MoE FFN.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -263,16 +498,42 @@ class TransformerDecoderBlock(nn.Module):
         self.sinkhorn_iters = config.sinkhorn_iters
 
         d_ff = config.d_ff if config.d_ff is not None else 4 * config.d_model
-        self.attn = CausalSelfAttention(
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_kv_heads=config.n_kv_heads,
-            max_seq_len=config.max_seq_len,
-            rope_theta=config.rope_theta,
-            dropout=config.dropout,
-            qk_norm=config.qk_norm
-        )
-        self.ffn = FeedForward(config.d_model, d_ff, dropout=config.dropout)
+
+        # Attention selection
+        if getattr(config, "attn_type", "gqa").lower() == "mla":
+            self.attn = MultiLatentAttention(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                max_seq_len=config.max_seq_len,
+                rope_theta=config.rope_theta,
+                dropout=config.dropout,
+                qk_norm=config.qk_norm
+            )
+        else:
+            self.attn = CausalSelfAttention(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                n_kv_heads=config.n_kv_heads,
+                max_seq_len=config.max_seq_len,
+                rope_theta=config.rope_theta,
+                dropout=config.dropout,
+                qk_norm=config.qk_norm
+            )
+
+        # FFN selection
+        if getattr(config, "ffn_type", "swiglu").lower() == "moe":
+            self.ffn = MoEFFN(
+                d_model=config.d_model,
+                d_ff=d_ff,
+                n_experts=config.n_experts,
+                n_experts_per_tok=config.n_experts_per_tok,
+                dropout=config.dropout
+            )
+        else:
+            self.ffn = FeedForward(config.d_model, d_ff, dropout=config.dropout)
+
         self.norm1 = RMSNorm(config.d_model)
         self.norm2 = RMSNorm(config.d_model)
 
@@ -294,7 +555,7 @@ class TransformerDecoderBlock(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache: bool = False) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         
-        if self.mode == 'standard':
+        if self.mode in ['standard', 'openmythos_rdt']:
             attn_out, present_kv = self.attn(self.norm1(state), past_key_value=past_key_value, use_cache=use_cache)
             x = state + attn_out
             out = x + self.ffn(self.norm2(x))
@@ -332,7 +593,6 @@ class TransformerDecoderBlock(nn.Module):
 
         elif self.mode == 'mhc':
             streams = state
-            # Attention sub-layer
             H_pre1 = torch.softmax(self.H_pre1_logits, dim=0)
             u1 = torch.einsum('s, s b t d -> b t d', H_pre1, streams)
             y1, present_kv = self.attn(self.norm1(u1), past_key_value=past_key_value, use_cache=use_cache)
@@ -346,7 +606,6 @@ class TransformerDecoderBlock(nn.Module):
             H_res1_mixed = (1.0 - alpha1) * I + alpha1 * H_res1
             streams = torch.einsum('i j, j b t d -> i b t d', H_res1_mixed, streams) + delta1
 
-            # FFN sub-layer
             H_pre2 = torch.softmax(self.H_pre2_logits, dim=0)
             u2 = torch.einsum('s, s b t d -> b t d', H_pre2, streams)
             y2 = self.ffn(self.norm2(u2))
@@ -366,13 +625,14 @@ class TransformerDecoderBlock(nn.Module):
 
 
 # ==========================================
-# 7. Complete Language Model
+# 9. Complete Language Model
 # ==========================================
 
 class TransformerLM(nn.Module):
     """
     Complete Decoder-only Autoregressive Language Model supporting <= 2B parameter scales.
-    Incorporates RoPE, GQA, QK-Norm, KV-Cache, and four routing variants.
+    Incorporates RoPE, GQA / MLA, QK-Norm, KV-Cache, MoEFFN, and five routing modes:
+    `standard`, `attn_res`, `delta_attn_res`, `mhc`, and `openmythos_rdt` (Fable 5 Recurrent-Depth).
     """
     def __init__(self, config: Union[ModelConfig, dict], vocab_size: Optional[int] = None):
         super().__init__()
@@ -388,25 +648,30 @@ class TransformerLM(nn.Module):
         self.attn_res_mode = config.attn_res_mode.lower()
         self.block_size_layers = config.block_size_layers
 
-        # Token embedding (no absolute position embedding since RoPE is used)
         self.tok_emb = nn.Embedding(self.vocab_size, self.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
-        # Transformer Blocks
-        self.blocks = nn.ModuleList([
-            TransformerDecoderBlock(config) for _ in range(config.n_layers)
-        ])
+        if self.mode == 'openmythos_rdt':
+            # Three-stage RDT: Prelude -> RecurrentBlock -> Coda
+            self.prelude = nn.ModuleList([
+                TransformerDecoderBlock(config) for _ in range(config.prelude_layers)
+            ])
+            self.recurrent = RecurrentBlock(config)
+            self.coda = nn.ModuleList([
+                TransformerDecoderBlock(config) for _ in range(config.coda_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TransformerDecoderBlock(config) for _ in range(config.n_layers)
+            ])
 
-        # Final Normalization and Output Projection
         self.norm = RMSNorm(self.d_model)
         self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False)
-        # Weight tying
         self.tok_emb.weight = self.lm_head.weight
 
         if self.mode == 'mhc':
             self.final_mix_logits = nn.Parameter(torch.randn(self.n_streams))
 
-        # Apply custom initialization
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -417,15 +682,59 @@ class TransformerLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]]:
+    def get_spectral_radius(self) -> Optional[float]:
+        """Returns the current recurrent block spectral radius if operating in openmythos_rdt mode."""
+        if self.mode == 'openmythos_rdt' and hasattr(self, 'recurrent'):
+            return self.recurrent.get_spectral_radius()
+        return None
+
+    def forward(self, idx: torch.Tensor, past_key_values: Optional[List[Any]] = None,
+                use_cache: bool = False, n_loops: Optional[int] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Any]]]:
         B, T = idx.shape
         x = self.tok_emb(idx)
         x = self.emb_dropout(x)
 
         present_key_values = [] if use_cache else None
 
-        if self.mode == 'standard':
+        if self.mode == 'openmythos_rdt':
+            state = x
+            # 1. Prelude blocks
+            for i, block in enumerate(self.prelude):
+                past_kv = past_key_values[i] if past_key_values is not None and i < len(past_key_values) else None
+                state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
+                if use_cache:
+                    present_key_values.append(present_kv)
+            
+            # Input injection vector e is captured after prelude
+            e = state
+
+            # 2. Determine loop count (adaptive depth or uniform sampling during training)
+            if n_loops is None:
+                if self.training and getattr(self.config, "uniform_loop_sampling", True):
+                    n_loops = torch.randint(1, self.config.max_loop_iters + 1, (1,)).item()
+                else:
+                    n_loops = self.config.max_loop_iters
+
+            recurrent_past_kv = None
+            if past_key_values is not None:
+                prelude_len = len(self.prelude)
+                recurrent_past_kv = past_key_values[prelude_len : prelude_len + n_loops]
+
+            state, rec_present_kvs = self.recurrent(state, e, n_loops=n_loops, past_key_value=recurrent_past_kv, use_cache=use_cache)
+            if use_cache and rec_present_kvs is not None:
+                present_key_values.extend(rec_present_kvs)
+
+            # 3. Coda blocks
+            for i, block in enumerate(self.coda):
+                idx_coda = len(self.prelude) + (len(rec_present_kvs) if rec_present_kvs else n_loops) + i
+                past_kv = past_key_values[idx_coda] if past_key_values is not None and idx_coda < len(past_key_values) else None
+                state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
+                if use_cache:
+                    present_key_values.append(present_kv)
+
+            out = self.norm(state)
+
+        elif self.mode == 'standard':
             state = x
             for i, block in enumerate(self.blocks):
                 past_kv = past_key_values[i] if past_key_values is not None else None
@@ -436,7 +745,6 @@ class TransformerLM(nn.Module):
 
         elif self.mode in ['attn_res', 'delta_attn_res']:
             if past_key_values is not None and len(past_key_values) > 0 and hasattr(self, "_cached_sources") and self._cached_sources is not None:
-                # During KV-cache incremental step in attn_res, we reuse prior cached sources
                 sources = self._cached_sources
             else:
                 sources = [x]
@@ -474,14 +782,19 @@ class TransformerLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None,
-                 use_cache: bool = True) -> torch.Tensor:
+                 use_cache: bool = True, effort: str = "high") -> torch.Tensor:
         """
         Autoregressive text generation using fast KV-cache decoding ($O(T)$ step cost).
+        Supports Fable 5 adaptive computation depth via the `effort` parameter when in `openmythos_rdt` mode.
         """
         self.eval()
         past_key_values = None
         if hasattr(self, "_cached_sources"):
             self._cached_sources = None
+
+        # Map effort to recurrent loop depth T
+        effort_map = {"low": 2, "medium": 4, "high": self.config.max_loop_iters, "xhigh": max(16, self.config.max_loop_iters * 2)}
+        n_loops = effort_map.get(effort.lower(), self.config.max_loop_iters) if self.mode == 'openmythos_rdt' else None
 
         for step in range(max_new_tokens):
             if use_cache and past_key_values is not None:
@@ -490,9 +803,9 @@ class TransformerLM(nn.Module):
                 idx_cond = idx[:, -self.max_seq_len:]
 
             if use_cache:
-                logits, past_key_values = self(idx_cond, past_key_values=past_key_values, use_cache=True)
+                logits, past_key_values = self(idx_cond, past_key_values=past_key_values, use_cache=True, n_loops=n_loops)
             else:
-                logits = self(idx_cond, use_cache=False)
+                logits = self(idx_cond, use_cache=False, n_loops=n_loops)
 
             logits = logits[:, -1, :] / max(temperature, 1e-5)
             if top_k is not None and top_k > 0:
