@@ -231,7 +231,10 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_step = checkpoint.get("step", 0) + 1
         if "rng_state" in checkpoint:
-            torch.set_rng_state(checkpoint["rng_state"])
+            try:
+                torch.set_rng_state(checkpoint["rng_state"])
+            except Exception as e:
+                print(f"Warning: Could not restore RNG state: {e}")
         if master_process:
             print(f"Resumed successfully at step {start_step}")
 
