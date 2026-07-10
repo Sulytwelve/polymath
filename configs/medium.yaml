@@ -1,0 +1,34 @@
+model:
+  d_model: 1024
+  n_heads: 16
+  n_kv_heads: 4
+  d_ff: 2816
+  n_layers: 24
+  max_seq_len: 2048
+  rope_theta: 50000.0
+  mode: standard
+  qk_norm: true
+  dropout: 0.1
+
+train:
+  batch_size: 16
+  gradient_accumulation_steps: 8
+  max_iters: 50000
+  lr: 0.0003
+  min_lr: 0.00003
+  warmup_iters: 2000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  use_amp: true
+  eval_interval: 1000
+  eval_iters: 50
+  log_interval: 50
+  checkpoint_dir: checkpoints
+
+tokenizer:
+  tokenizer_type: tiktoken
+  tiktoken_encoding: cl100k_base
+
+data:
+  dataset_type: mmap
+  mmap_data_dir: data
