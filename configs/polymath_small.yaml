@@ -24,8 +24,8 @@ model:
   dropout: 0.1
 
 train:
-  batch_size: 32
-  gradient_accumulation_steps: 4
+  batch_size: 4
+  gradient_accumulation_steps: 32
   max_iters: 10000
   lr: 0.0006
   min_lr: 0.00006
