@@ -331,8 +331,13 @@ def main():
                     "config": config,
                     "vocab_size": config.model.vocab_size,
                     "rng_state": torch.get_rng_state()
-                }, ckpt_path)
-                print(f"Checkpoint saved to {ckpt_path}")
+                }
+                checkpoint_name = ckpt_path.replace(".pt", f"_step_{step:05d}.pt")
+                torch.save(checkpoint, checkpoint_name)
+                
+                # Also save the 'latest' pointer file for easy resuming
+                torch.save(checkpoint, ckpt_path)
+                print(f"Checkpoint saved to {checkpoint_name} and {ckpt_path}")
 
     if master_process:
         print("Training successfully completed!")
