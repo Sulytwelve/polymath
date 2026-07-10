@@ -118,6 +118,9 @@ def estimate_loss(model: nn.Module, train_dataset, val_dataset, config: Config, 
             with torch.amp.autocast(device_type=device.split(":")[0], enabled=config.train.use_amp and device != "cpu"):
                 logits = model(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                if config.model.ffn_type.lower() == 'moe':
+                    aux_loss = getattr(model, 'aux_loss', torch.tensor(0.0))
+                    loss = loss + getattr(config.model, 'moe_aux_loss_coeff', 0.01) * aux_loss
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
@@ -126,10 +129,10 @@ def estimate_loss(model: nn.Module, train_dataset, val_dataset, config: Config, 
 def main():
     parser = argparse.ArgumentParser(description="Production-grade Training Loop for <=2B Autoregressive Transformer Models.")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file (e.g. configs/tiny.yaml).")
-    parser.add_argument("--mode", type=str, default=None, choices=["standard", "attn_res", "delta_attn_res", "mhc", "openmythos_rdt"], help="Override model routing mode.")
+    parser.add_argument("--mode", type=str, default=None, choices=["polymath", "standard", "attn_res", "delta_attn_res", "openmythos_rdt"], help="Override model routing mode.")
     parser.add_argument("--attn_type", type=str, default=None, choices=["gqa", "mla"], help="Override attention mechanism (GQA vs Multi-Latent Attention).")
     parser.add_argument("--ffn_type", type=str, default=None, choices=["swiglu", "moe"], help="Override feed-forward block type (SwiGLU vs Sparse MoE).")
-    parser.add_argument("--max_loop_iters", type=int, default=None, help="Override max loop iterations for openmythos_rdt.")
+    parser.add_argument("--max_loop_iters", type=int, default=None, help="Override max loop iterations for polymath/openmythos_rdt.")
     parser.add_argument("--n_experts", type=int, default=None, help="Override routed experts count when ffn_type is moe.")
     parser.add_argument("--iters", type=int, default=None, help="Override training iterations.")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
@@ -142,6 +145,7 @@ def main():
     parser.add_argument("--tokenizer", type=str, default=None, choices=["char", "tiktoken"], help="Override tokenizer type.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt file to resume training from.")
     parser.add_argument("--eval_interval", type=int, default=None, help="Interval for evaluation.")
+    parser.add_argument("--compile", action="store_true", help="Compile model using torch.compile.")
     args = parser.parse_args()
 
     is_ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device = setup_ddp()
@@ -159,6 +163,8 @@ def main():
         config = Config()
 
     config.update_from_args(args)
+    if args.compile:
+        config.train.compile_model = True
     if args.resume:
         config.train.resume_checkpoint = args.resume
 
@@ -188,6 +194,13 @@ def main():
     if master_process:
         print(f"Initializing TransformerLM in '{config.model.mode}' mode with d_model={config.model.d_model}, n_layers={config.model.n_layers}...")
     model = TransformerLM(config.model, vocab_size=config.model.vocab_size).to(device)
+
+    if config.train.activation_checkpointing:
+        if master_process:
+            print("Enabling activation checkpointing for memory efficiency.")
+        model.use_activation_checkpointing = True
+        if hasattr(model, 'recurrent'):
+            model.recurrent.use_activation_checkpointing = True
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if master_process:
@@ -224,6 +237,11 @@ def main():
         if master_process:
             print(f"Resumed successfully at step {start_step}")
 
+    if config.train.compile_model and hasattr(torch, "compile"):
+        if master_process:
+            print("Compiling model with torch.compile for optimized execution...")
+        model = torch.compile(model)
+
     if is_ddp:
         model = DDP(model, device_ids=[ddp_local_rank] if device != "cpu" else None)
 
@@ -258,6 +276,9 @@ def main():
             with torch.amp.autocast(device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp):
                 logits = model(xb)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
+                if config.model.ffn_type.lower() == 'moe':
+                    aux_loss = raw_model.aux_loss if not is_ddp else model.module.aux_loss
+                    loss = loss + getattr(config.model, 'moe_aux_loss_coeff', 0.01) * aux_loss
                 loss = loss / config.train.gradient_accumulation_steps
 
             accum_loss += loss.item()

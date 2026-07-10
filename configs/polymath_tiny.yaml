@@ -3,10 +3,11 @@ model:
   n_heads: 6
   n_kv_heads: 6
   d_ff: 768
-  n_layers: 4
+  n_layers: 4  # NOTE: unused in polymath mode (uses prelude_layers + 1 recurrent + coda_layers)
   max_seq_len: 256
   rope_theta: 10000.0
-  mode: openmythos_rdt
+  mode: polymath
+  attn_res_mode: full
   attn_type: mla
   kv_lora_rank: 64
   qk_rope_head_dim: 32

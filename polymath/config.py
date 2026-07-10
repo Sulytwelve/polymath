@@ -13,24 +13,23 @@ class ModelConfig:
     vocab_size: int = 100277     # Default for tiktoken cl100k_base (or set dynamically by CharDataset)
     max_seq_len: int = 512       # Maximum sequence length / context window
     rope_theta: float = 10000.0  # Rotary position embedding base frequency
-    mode: str = "standard"       # "standard", "attn_res", "delta_attn_res", "mhc", "openmythos_rdt"
-    n_streams: int = 4           # For mHC mode
-    sinkhorn_iters: int = 10     # For mHC mode
-    attn_res_mode: str = "full"  # "full" or "block" for attn_res
+    mode: str = "polymath"       # "polymath" (Unified RDT+AttnRes+MLA+MoE), "standard", "attn_res", "delta_attn_res", "openmythos_rdt"
+    attn_res_mode: str = "full"  # "full" or "block" for attn_res / polymath
     block_size_layers: int = 2   # Number of layers per block when attn_res_mode == "block"
     dropout: float = 0.0
     qk_norm: bool = True         # Apply RMSNorm to Q and K before attention dot product
 
-    # New options for OpenMythos RDT / Fable 5 reverse engineering
+    # Options for PolyMath / Anthropic reverse-engineered Mythos (Fable 5) architecture
     attn_type: str = "gqa"       # "gqa" or "mla" (Multi-Latent Attention)
     kv_lora_rank: int = 64       # Latent KV compression rank when attn_type == "mla"
     qk_rope_head_dim: int = 32   # Decoupled RoPE head dim when attn_type == "mla"
     ffn_type: str = "swiglu"     # "swiglu" or "moe" (Sparse Mixture of Experts)
     n_experts: int = 4           # Total routed experts for MoEFFN
     n_experts_per_tok: int = 2   # Top-k routed experts per token for MoEFFN
-    prelude_layers: int = 1      # Number of prelude transformer blocks when mode == "openmythos_rdt"
-    coda_layers: int = 1         # Number of coda transformer blocks when mode == "openmythos_rdt"
-    max_loop_iters: int = 6      # Max loop iterations T for recurrent block when mode == "openmythos_rdt"
+    moe_aux_loss_coeff: float = 0.01  # Coefficient for MoE load-balancing auxiliary loss
+    prelude_layers: int = 1      # Number of prelude transformer blocks when mode in ("polymath", "openmythos_rdt")
+    coda_layers: int = 1         # Number of coda transformer blocks when mode in ("polymath", "openmythos_rdt")
+    max_loop_iters: int = 6      # Max loop iterations T for recurrent block when mode in ("polymath", "openmythos_rdt")
     uniform_loop_sampling: bool = True  # Uniformly sample T in [1, max_loop_iters] during training
     lora_rank: int = 16          # Depth-wise LoRA rank injected across loop iterations
 
@@ -40,6 +39,11 @@ class ModelConfig:
             hidden_dim = int(2 * 4 * self.d_model / 3)
             self.d_ff = 64 * ((hidden_dim + 63) // 64)
         assert self.n_heads % self.n_kv_heads == 0, f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+        assert self.d_model % self.n_heads == 0, f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+        valid_modes = {"polymath", "standard", "attn_res", "delta_attn_res", "openmythos_rdt"}
+        assert self.mode.lower() in valid_modes, f"Invalid mode '{self.mode}'. Must be one of: {valid_modes}"
+        assert self.attn_type.lower() in {"gqa", "mla"}, f"Invalid attn_type '{self.attn_type}'"
+        assert self.ffn_type.lower() in {"swiglu", "moe"}, f"Invalid ffn_type '{self.ffn_type}'"
 
 @dataclass
 class TrainConfig:
@@ -58,6 +62,8 @@ class TrainConfig:
     save_interval: int = 500
     checkpoint_dir: str = "checkpoints"
     resume_checkpoint: Optional[str] = None
+    activation_checkpointing: bool = False  # Trade computation for memory at <=2B scale
+    compile_model: bool = False             # Use torch.compile for optimized execution
 
 @dataclass
 class TokenizerConfig:

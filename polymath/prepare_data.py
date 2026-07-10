@@ -2,7 +2,6 @@ import os
 import json
 import argparse
 import numpy as np
-from tqdm import tqdm
 from tokenizer import get_tokenizer
 
 def prepare_data(input_file: str, output_dir: str, tokenizer_type: str = "tiktoken", encoding_name: str = "cl100k_base", val_ratio: float = 0.1):

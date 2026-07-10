@@ -2,8 +2,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from typing import Optional, Tuple, List, Union, Dict, Any
-from config import ModelConfig
+try:
+    from polymath.config import ModelConfig
+except ImportError:
+    from config import ModelConfig
 
 # ==========================================
 # 1. Normalization layers
@@ -127,20 +131,6 @@ class AttnResOperator(nn.Module):
         return out
 
 
-# ==========================================
-# 4. Manifold-Constrained Hyper-Connections (DeepSeek style)
-# ==========================================
-
-def sinkhorn_knopp_projection(logits: torch.Tensor, max_iter: int = 20, eps: float = 1e-12) -> torch.Tensor:
-    """
-    Applies the Sinkhorn-Knopp algorithm to project an unconstrained matrix
-    onto the Birkhoff polytope (manifold of doubly stochastic matrices).
-    """
-    M = torch.exp(logits)
-    for _ in range(max_iter):
-        M = M / (M.sum(dim=-1, keepdim=True) + eps)
-        M = M / (M.sum(dim=-2, keepdim=True) + eps)
-    return M
 
 
 # ==========================================
@@ -362,6 +352,7 @@ class MoEFFN(nn.Module):
     """
     Sparse Mixture-of-Experts (MoE) FFN with Shared + Routed Experts (DeepSeek-V3 style).
     Controls computation per token inside recurrent loop iterations.
+    Includes load-balancing auxiliary loss to prevent expert collapse.
     """
     def __init__(self, d_model: int, d_ff: int, n_experts: int = 4, n_experts_per_tok: int = 2, dropout: float = 0.0):
         super().__init__()
@@ -377,6 +368,20 @@ class MoEFFN(nn.Module):
             FeedForward(d_model, expert_d_ff, dropout=dropout) for _ in range(n_experts)
         ])
         self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.aux_loss: torch.Tensor = torch.tensor(0.0)
+
+    def _compute_aux_loss(self, gate_probs: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Switch Transformer load-balancing loss:
+        L_aux = n_experts * sum_i(f_i * P_i)
+        where f_i = fraction of tokens dispatched to expert i
+              P_i = mean gate probability for expert i across all tokens
+        """
+        n_tokens = gate_probs.shape[0]
+        one_hot = F.one_hot(indices, num_classes=self.n_experts).float()  # [n_tokens, k, n_experts]
+        f = one_hot.sum(dim=1).sum(dim=0) / max(n_tokens, 1)  # [n_experts]
+        P = gate_probs.mean(dim=0)  # [n_experts]
+        return self.n_experts * (f * P).sum()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Shared expert pathway
@@ -384,14 +389,18 @@ class MoEFFN(nn.Module):
 
         # Routed experts gating
         gate_logits = self.router(x)  # [B, T, n_experts]
-        weights, indices = torch.topk(torch.softmax(gate_logits, dim=-1), k=self.n_experts_per_tok, dim=-1)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        weights, indices = torch.topk(gate_probs, k=self.n_experts_per_tok, dim=-1)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)  # re-normalize top-k weights
 
-        # Dispatch and combine top-k expert outputs
-        routed_out = torch.zeros_like(x)
+        # Compute auxiliary loss for load balancing
         B, T, _ = x.shape
-        flat_x = x.view(-1, self.router.in_features)
+        flat_probs = gate_probs.view(-1, self.n_experts)
         flat_indices = indices.view(-1, self.n_experts_per_tok)
+        self.aux_loss = self._compute_aux_loss(flat_probs, flat_indices)
+
+        # Dispatch and combine top-k expert outputs
+        flat_x = x.view(-1, self.router.in_features)
         flat_weights = weights.view(-1, self.n_experts_per_tok)
         flat_out = torch.zeros_like(flat_x)
 
@@ -402,7 +411,7 @@ class MoEFFN(nn.Module):
             token_idx, rank_idx = mask.nonzero(as_tuple=True)
             expert_in = flat_x[token_idx]
             expert_out = expert(expert_in)
-            flat_out.index_add_(0, token_idx, expert_out * flat_weights[token_idx, rank_idx].unsqueeze(-1))
+            flat_out.index_add_(0, token_idx, (expert_out * flat_weights[token_idx, rank_idx].unsqueeze(-1)).to(flat_out.dtype))
 
         routed_out = flat_out.view(B, T, -1)
         return shared_out + routed_out
@@ -434,7 +443,7 @@ class DepthWiseLoRA(nn.Module):
 
 class RecurrentBlock(nn.Module):
     """
-    Recurrent-Depth Transformer (RDT) Block for OpenMythos / Fable 5 architecture.
+    Recurrent-Depth Transformer (RDT) Block for PolyMath / Anthropic reverse-engineered Mythos (Fable 5) architecture.
     Applies a weight-shared Transformer block iteratively T times with:
     1. Continuous input injection `e` at every step.
     2. Depth-wise LoRA perturbation per loop iteration.
@@ -442,9 +451,10 @@ class RecurrentBlock(nn.Module):
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.block = TransformerDecoderBlock(config)
+        self.block = TransformerDecoderBlock(config, skip_residual=True)
         self.max_loop_iters = config.max_loop_iters
         self.d_model = config.d_model
+        self.use_activation_checkpointing = False
 
         # Parameterize stable diagonal contraction matrix A: diag(exp(-softplus(A_raw)))
         self.A_diag_raw = nn.Parameter(torch.ones(config.d_model) * 0.5)
@@ -462,15 +472,28 @@ class RecurrentBlock(nn.Module):
         return self.get_A_diag().max().item()
 
     def forward(self, h: torch.Tensor, e: torch.Tensor, n_loops: int,
-                past_key_value: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+                sources: Optional[List[torch.Tensor]] = None,
+                past_key_value: Optional[Union[List[Tuple[torch.Tensor, torch.Tensor]], Dict[str, Tuple[torch.Tensor, torch.Tensor]]]] = None,
+                use_cache: bool = False) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         present_kvs = [] if use_cache else None
         A = self.get_A_diag().view(1, 1, -1)
         B_e = self.B_proj(e)
 
         for t in range(n_loops):
-            past_kv = past_key_value[t] if past_key_value is not None and t < len(past_key_value) else None
-            delta, _, present_kv = self.block(h, past_key_value=past_kv, use_cache=use_cache)
+            past_kv = None
+            if past_key_value is not None:
+                if isinstance(past_key_value, dict):
+                    past_kv = past_key_value.get(f"recurrent_{t}")
+                elif t < len(past_key_value):
+                    past_kv = past_key_value[t]
+
+            if self.use_activation_checkpointing and self.training and not use_cache:
+                delta, sources, present_kv = torch_checkpoint(
+                    self.block, h, sources, past_kv, use_cache, use_reentrant=False
+                )
+            else:
+                delta, sources, present_kv = self.block(h, sources=sources, past_key_value=past_kv, use_cache=use_cache)
+
             if use_cache:
                 present_kvs.append(present_kv)
 
@@ -478,8 +501,10 @@ class RecurrentBlock(nn.Module):
             delta = delta + self.lora_per_loop(t, h)
             # Stable LTI recurrence update: h_{t+1} = A * h_t + B * e + delta
             h = (h * A) + B_e + delta
+            if sources is not None:
+                sources.append(h)
 
-        return h, present_kvs
+        return h, sources, present_kvs
 
 
 # ==========================================
@@ -488,14 +513,14 @@ class RecurrentBlock(nn.Module):
 
 class TransformerDecoderBlock(nn.Module):
     """
-    Modular Transformer Block supporting standard PreNorm residuals, AttnRes, mHC, and OpenMythos RDT.
+    Modular Transformer Block supporting standard PreNorm residuals, AttnRes, and PolyMath / OpenMythos RDT.
     Dynamically routes between GQA / MLA attention and SwiGLU / MoE FFN.
+    When skip_residual=True (used inside RecurrentBlock), returns pure delta without internal residuals.
     """
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, skip_residual: bool = False):
         super().__init__()
         self.mode = config.mode.lower()
-        self.n_streams = config.n_streams
-        self.sinkhorn_iters = config.sinkhorn_iters
+        self.skip_residual = skip_residual
 
         d_ff = config.d_ff if config.d_ff is not None else 4 * config.d_model
 
@@ -537,19 +562,9 @@ class TransformerDecoderBlock(nn.Module):
         self.norm1 = RMSNorm(config.d_model)
         self.norm2 = RMSNorm(config.d_model)
 
-        if self.mode in ['attn_res', 'delta_attn_res']:
+        if self.mode in ['attn_res', 'delta_attn_res', 'polymath']:
             self.attn_res1 = AttnResOperator(config.d_model)
             self.attn_res2 = AttnResOperator(config.d_model)
-        elif self.mode == 'mhc':
-            self.H_res1_logits = nn.Parameter(torch.randn(self.n_streams, self.n_streams))
-            self.H_pre1_logits = nn.Parameter(torch.randn(self.n_streams))
-            self.H_post1_logits = nn.Parameter(torch.randn(self.n_streams))
-            self.alpha1_logits = nn.Parameter(torch.zeros(1))
-
-            self.H_res2_logits = nn.Parameter(torch.randn(self.n_streams, self.n_streams))
-            self.H_pre2_logits = nn.Parameter(torch.randn(self.n_streams))
-            self.H_post2_logits = nn.Parameter(torch.randn(self.n_streams))
-            self.alpha2_logits = nn.Parameter(torch.zeros(1))
 
     def forward(self, state: torch.Tensor, sources: Optional[List[torch.Tensor]] = None,
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -557,9 +572,47 @@ class TransformerDecoderBlock(nn.Module):
         
         if self.mode in ['standard', 'openmythos_rdt']:
             attn_out, present_kv = self.attn(self.norm1(state), past_key_value=past_key_value, use_cache=use_cache)
-            x = state + attn_out
-            out = x + self.ffn(self.norm2(x))
-            return out, None, present_kv
+            if self.skip_residual:
+                # Pure delta mode for RecurrentBlock: no internal residual connections
+                ffn_out = self.ffn(self.norm2(attn_out))
+                return attn_out + ffn_out, sources, present_kv
+            else:
+                x = state + attn_out
+                out = x + self.ffn(self.norm2(x))
+                return out, sources, present_kv
+
+        elif self.mode == 'polymath':
+            if sources is not None and len(sources) > 0:
+                stacked_sources1 = torch.stack(sources, dim=0)
+                u1 = self.attn_res1(stacked_sources1)
+                attn_out, present_kv = self.attn(self.norm1(u1), past_key_value=past_key_value, use_cache=use_cache)
+                if self.skip_residual:
+                    # Inside RecurrentBlock: return delta after AttnRes historical mixing
+                    sources.append(u1 + attn_out)
+                    stacked_sources2 = torch.stack(sources, dim=0)
+                    u2 = self.attn_res2(stacked_sources2)
+                    ffn_out = self.ffn(self.norm2(u2))
+                    return attn_out + ffn_out, sources, present_kv
+                else:
+                    # Prelude/Coda blocks: append intermediate residuals and return updated state
+                    h1 = u1 + attn_out
+                    sources.append(h1)
+                    stacked_sources2 = torch.stack(sources, dim=0)
+                    u2 = self.attn_res2(stacked_sources2)
+                    ffn_out = self.ffn(self.norm2(u2))
+                    out = u2 + ffn_out
+                    sources.append(out)
+                    return out, sources, present_kv
+            else:
+                # Fallback when sources is not initialized
+                attn_out, present_kv = self.attn(self.norm1(state), past_key_value=past_key_value, use_cache=use_cache)
+                if self.skip_residual:
+                    ffn_out = self.ffn(self.norm2(attn_out))
+                    return attn_out + ffn_out, None, present_kv
+                else:
+                    x = state + attn_out
+                    out = x + self.ffn(self.norm2(x))
+                    return out, None, present_kv
 
         elif self.mode == 'attn_res':
             assert sources is not None, "In attn_res mode, sources list must be provided."
@@ -591,35 +644,6 @@ class TransformerDecoderBlock(nn.Module):
             state_out = torch.sum(stacked_sources2, dim=0) + y2
             return state_out, sources, present_kv
 
-        elif self.mode == 'mhc':
-            streams = state
-            H_pre1 = torch.softmax(self.H_pre1_logits, dim=0)
-            u1 = torch.einsum('s, s b t d -> b t d', H_pre1, streams)
-            y1, present_kv = self.attn(self.norm1(u1), past_key_value=past_key_value, use_cache=use_cache)
-
-            H_post1 = torch.softmax(self.H_post1_logits, dim=0)
-            delta1 = torch.einsum('s, b t d -> s b t d', H_post1, y1)
-
-            H_res1 = sinkhorn_knopp_projection(self.H_res1_logits, max_iter=self.sinkhorn_iters)
-            alpha1 = torch.sigmoid(self.alpha1_logits)
-            I = torch.eye(self.n_streams, device=streams.device)
-            H_res1_mixed = (1.0 - alpha1) * I + alpha1 * H_res1
-            streams = torch.einsum('i j, j b t d -> i b t d', H_res1_mixed, streams) + delta1
-
-            H_pre2 = torch.softmax(self.H_pre2_logits, dim=0)
-            u2 = torch.einsum('s, s b t d -> b t d', H_pre2, streams)
-            y2 = self.ffn(self.norm2(u2))
-
-            H_post2 = torch.softmax(self.H_post2_logits, dim=0)
-            delta2 = torch.einsum('s, b t d -> s b t d', H_post2, y2)
-
-            H_res2 = sinkhorn_knopp_projection(self.H_res2_logits, max_iter=self.sinkhorn_iters)
-            alpha2 = torch.sigmoid(self.alpha2_logits)
-            H_res2_mixed = (1.0 - alpha2) * I + alpha2 * H_res2
-            streams = torch.einsum('i j, j b t d -> i b t d', H_res2_mixed, streams) + delta2
-
-            return streams, None, present_kv
-
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -632,7 +656,7 @@ class TransformerLM(nn.Module):
     """
     Complete Decoder-only Autoregressive Language Model supporting <= 2B parameter scales.
     Incorporates RoPE, GQA / MLA, QK-Norm, KV-Cache, MoEFFN, and five routing modes:
-    `standard`, `attn_res`, `delta_attn_res`, `mhc`, and `openmythos_rdt` (Fable 5 Recurrent-Depth).
+    `standard`, `attn_res`, `delta_attn_res`, `polymath` (Unified RDT+AttnRes+MLA+MoE), and `openmythos_rdt`.
     """
     def __init__(self, config: Union[ModelConfig, dict], vocab_size: Optional[int] = None):
         super().__init__()
@@ -644,15 +668,14 @@ class TransformerLM(nn.Module):
         self.d_model = config.d_model
         self.max_seq_len = config.max_seq_len
         self.mode = config.mode.lower()
-        self.n_streams = config.n_streams
         self.attn_res_mode = config.attn_res_mode.lower()
         self.block_size_layers = config.block_size_layers
 
         self.tok_emb = nn.Embedding(self.vocab_size, self.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
-        if self.mode == 'openmythos_rdt':
-            # Three-stage RDT: Prelude -> RecurrentBlock -> Coda
+        if self.mode in ['openmythos_rdt', 'polymath']:
+            # Three-stage RDT/PolyMath: Prelude -> RecurrentBlock -> Coda
             self.prelude = nn.ModuleList([
                 TransformerDecoderBlock(config) for _ in range(config.prelude_layers)
             ])
@@ -669,9 +692,8 @@ class TransformerLM(nn.Module):
         self.lm_head = nn.Linear(self.d_model, self.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
 
-        if self.mode == 'mhc':
-            self.final_mix_logits = nn.Parameter(torch.randn(self.n_streams))
-
+        self.use_activation_checkpointing = False
+        self.aux_loss = torch.tensor(0.0)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -683,27 +705,36 @@ class TransformerLM(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_spectral_radius(self) -> Optional[float]:
-        """Returns the current recurrent block spectral radius if operating in openmythos_rdt mode."""
-        if self.mode == 'openmythos_rdt' and hasattr(self, 'recurrent'):
+        """Returns the current recurrent block spectral radius if operating in openmythos_rdt/polymath mode."""
+        if self.mode in ['openmythos_rdt', 'polymath'] and hasattr(self, 'recurrent'):
             return self.recurrent.get_spectral_radius()
         return None
 
-    def forward(self, idx: torch.Tensor, past_key_values: Optional[List[Any]] = None,
-                use_cache: bool = False, n_loops: Optional[int] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Any]]]:
+    def forward(self, idx: torch.Tensor, past_key_values: Optional[Union[List[Any], Dict[str, Any]]] = None,
+                use_cache: bool = False, n_loops: Optional[int] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, Union[List[Any], Dict[str, Any]]]]:
         B, T = idx.shape
         x = self.tok_emb(idx)
         x = self.emb_dropout(x)
 
         present_key_values = [] if use_cache else None
 
-        if self.mode == 'openmythos_rdt':
+        if self.mode in ['openmythos_rdt', 'polymath']:
             state = x
+            past_kv_dict = past_key_values if isinstance(past_key_values, dict) else None
+            present_kv_dict = {} if use_cache else None
+
+            sources = self._cached_sources if (self.mode == 'polymath' and past_key_values is not None and hasattr(self, "_cached_sources") and self._cached_sources is not None) else ([state] if self.mode == 'polymath' else None)
+
             # 1. Prelude blocks
             for i, block in enumerate(self.prelude):
-                past_kv = past_key_values[i] if past_key_values is not None and i < len(past_key_values) else None
-                state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
+                cache_key = f"prelude_{i}"
+                past_kv = past_kv_dict.get(cache_key) if past_kv_dict is not None else (past_key_values[i] if past_key_values is not None and isinstance(past_key_values, list) and i < len(past_key_values) else None)
+                if self.use_activation_checkpointing and self.training and not use_cache:
+                    state, sources, present_kv = torch_checkpoint(block, state, sources, past_kv, use_cache, use_reentrant=False)
+                else:
+                    state, sources, present_kv = block(state, sources=sources, past_key_value=past_kv, use_cache=use_cache)
                 if use_cache:
-                    present_key_values.append(present_kv)
+                    present_kv_dict[cache_key] = present_kv
             
             # Input injection vector e is captured after prelude
             e = state
@@ -716,29 +747,50 @@ class TransformerLM(nn.Module):
                     n_loops = self.config.max_loop_iters
 
             recurrent_past_kv = None
-            if past_key_values is not None:
+            if past_kv_dict is not None:
+                recurrent_past_kv = {f"recurrent_{t}": past_kv_dict.get(f"recurrent_{t}") for t in range(n_loops)}
+            elif past_key_values is not None and isinstance(past_key_values, list):
                 prelude_len = len(self.prelude)
                 recurrent_past_kv = past_key_values[prelude_len : prelude_len + n_loops]
 
-            state, rec_present_kvs = self.recurrent(state, e, n_loops=n_loops, past_key_value=recurrent_past_kv, use_cache=use_cache)
+            state, sources, rec_present_kvs = self.recurrent(state, e, n_loops=n_loops, sources=sources, past_key_value=recurrent_past_kv, use_cache=use_cache)
             if use_cache and rec_present_kvs is not None:
-                present_key_values.extend(rec_present_kvs)
+                for t, kv in enumerate(rec_present_kvs):
+                    present_kv_dict[f"recurrent_{t}"] = kv
 
             # 3. Coda blocks
             for i, block in enumerate(self.coda):
-                idx_coda = len(self.prelude) + (len(rec_present_kvs) if rec_present_kvs else n_loops) + i
-                past_kv = past_key_values[idx_coda] if past_key_values is not None and idx_coda < len(past_key_values) else None
-                state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
+                cache_key = f"coda_{i}"
+                if past_kv_dict is not None:
+                    past_kv = past_kv_dict.get(cache_key)
+                elif past_key_values is not None and isinstance(past_key_values, list):
+                    idx_coda = len(self.prelude) + (len(rec_present_kvs) if rec_present_kvs else n_loops) + i
+                    past_kv = past_key_values[idx_coda] if idx_coda < len(past_key_values) else None
+                else:
+                    past_kv = None
+
+                if self.use_activation_checkpointing and self.training and not use_cache:
+                    state, sources, present_kv = torch_checkpoint(block, state, sources, past_kv, use_cache, use_reentrant=False)
+                else:
+                    state, sources, present_kv = block(state, sources=sources, past_key_value=past_kv, use_cache=use_cache)
                 if use_cache:
-                    present_key_values.append(present_kv)
+                    present_kv_dict[cache_key] = present_kv
+
+            if use_cache and self.mode == 'polymath' and sources is not None:
+                self._cached_sources = sources
 
             out = self.norm(state)
+            if use_cache:
+                present_key_values = present_kv_dict
 
         elif self.mode == 'standard':
             state = x
             for i, block in enumerate(self.blocks):
                 past_kv = past_key_values[i] if past_key_values is not None else None
-                state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
+                if self.use_activation_checkpointing and self.training and not use_cache:
+                    state, _, present_kv = torch_checkpoint(block, state, None, past_kv, use_cache, use_reentrant=False)
+                else:
+                    state, _, present_kv = block(state, past_key_value=past_kv, use_cache=use_cache)
                 if use_cache:
                     present_key_values.append(present_kv)
             out = self.norm(state)
@@ -752,7 +804,10 @@ class TransformerLM(nn.Module):
 
             for i, block in enumerate(self.blocks):
                 past_kv = past_key_values[i] if past_key_values is not None else None
-                state, sources, present_kv = block(state, sources=sources, past_key_value=past_kv, use_cache=use_cache)
+                if self.use_activation_checkpointing and self.training and not use_cache:
+                    state, sources, present_kv = torch_checkpoint(block, state, sources, past_kv, use_cache, use_reentrant=False)
+                else:
+                    state, sources, present_kv = block(state, sources=sources, past_key_value=past_kv, use_cache=use_cache)
                 if use_cache:
                     present_key_values.append(present_kv)
 
@@ -763,17 +818,13 @@ class TransformerLM(nn.Module):
                 self._cached_sources = sources
             out = self.norm(state)
 
-        elif self.mode == 'mhc':
-            streams = x.unsqueeze(0).repeat(self.n_streams, 1, 1, 1)
-            for i, block in enumerate(self.blocks):
-                past_kv = past_key_values[i] if past_key_values is not None else None
-                streams, _, present_kv = block(streams, past_key_value=past_kv, use_cache=use_cache)
-                if use_cache:
-                    present_key_values.append(present_kv)
-
-            final_mix = torch.softmax(self.final_mix_logits, dim=0)
-            state = torch.einsum('s, s b t d -> b t d', final_mix, streams)
-            out = self.norm(state)
+        # Collect MoE auxiliary losses across blocks
+        self.aux_loss = torch.tensor(0.0, device=idx.device)
+        if getattr(self.config, 'ffn_type', 'swiglu').lower() == 'moe':
+            blocks_to_check = (list(self.prelude) + [self.recurrent.block] + list(self.coda)) if self.mode in ['openmythos_rdt', 'polymath'] else list(self.blocks)
+            for block in blocks_to_check:
+                if hasattr(block, 'ffn') and hasattr(block.ffn, 'aux_loss'):
+                    self.aux_loss = self.aux_loss + block.ffn.aux_loss
 
         logits = self.lm_head(out)
         if use_cache:
@@ -785,7 +836,7 @@ class TransformerLM(nn.Module):
                  use_cache: bool = True, effort: str = "high") -> torch.Tensor:
         """
         Autoregressive text generation using fast KV-cache decoding ($O(T)$ step cost).
-        Supports Fable 5 adaptive computation depth via the `effort` parameter when in `openmythos_rdt` mode.
+        Supports Anthropic reverse-engineered Mythos (Fable 5) adaptive computation depth via the `effort` parameter when in `polymath`/`openmythos_rdt` mode.
         """
         self.eval()
         past_key_values = None
@@ -794,7 +845,7 @@ class TransformerLM(nn.Module):
 
         # Map effort to recurrent loop depth T
         effort_map = {"low": 2, "medium": 4, "high": self.config.max_loop_iters, "xhigh": max(16, self.config.max_loop_iters * 2)}
-        n_loops = effort_map.get(effort.lower(), self.config.max_loop_iters) if self.mode == 'openmythos_rdt' else None
+        n_loops = effort_map.get(effort.lower(), self.config.max_loop_iters) if self.mode in ['openmythos_rdt', 'polymath'] else None
 
         for step in range(max_new_tokens):
             if use_cache and past_key_values is not None:

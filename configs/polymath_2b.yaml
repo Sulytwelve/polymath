@@ -1,0 +1,49 @@
+# PolyMath ~2B (Anthropic reverse-engineered Mythos RDT + Kimi AttnRes + DeepSeek MLA + MoE)
+model:
+  d_model: 2048
+  n_heads: 32
+  n_kv_heads: 8
+  d_ff: 5632
+  max_seq_len: 4096
+  rope_theta: 500000.0
+  mode: polymath
+  attn_res_mode: full
+  attn_type: mla
+  kv_lora_rank: 256
+  qk_rope_head_dim: 64
+  ffn_type: moe
+  n_experts: 8
+  n_experts_per_tok: 2
+  moe_aux_loss_coeff: 0.01
+  prelude_layers: 3
+  coda_layers: 3
+  max_loop_iters: 10
+  uniform_loop_sampling: true
+  lora_rank: 64
+  qk_norm: true
+  dropout: 0.05
+
+train:
+  batch_size: 4
+  gradient_accumulation_steps: 32   # effective batch size = 128
+  max_iters: 200000
+  lr: 0.00015
+  min_lr: 0.000015
+  warmup_iters: 5000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  use_amp: true
+  eval_interval: 2000
+  eval_iters: 50
+  log_interval: 50
+  checkpoint_dir: checkpoints
+  activation_checkpointing: true
+  compile_model: false
+
+tokenizer:
+  tokenizer_type: tiktoken
+  tiktoken_encoding: cl100k_base
+
+data:
+  dataset_type: mmap
+  mmap_data_dir: data
