@@ -1,7 +1,7 @@
 [project]
 name = "polymath"
 version = "0.1.0"
-description = "PolyMath: Unified <=2B Architecture merging Anthropic reverse-engineered Mythos/Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA/MoE"
+description = "PolyMath: Unified <=2B Architecture merging Anthropic reverse-engineered Mythos/Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

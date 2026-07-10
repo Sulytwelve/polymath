@@ -1,6 +1,6 @@
 # polymath: Codebase Reference & Developer Guide
 
-This document provides a comprehensive guide to the `polymath` codebase for developers, researchers, and code-reviewing agents. It outlines the project's design philosophy, architectural implementations of modern Transformer components (RoPE, GQA/MLA, QK-Norm, MoEFFN, KV-Cache) and five residual routing and structural variants (`polymath`, `standard`, `attn_res`, `delta_attn_res`, `openmythos_rdt`), directory map, data processing pipeline, and usage commands.
+This document provides a comprehensive guide to the `polymath` codebase for developers, researchers, and code-reviewing agents. It outlines the project's design philosophy, architectural implementations of modern Transformer components (RoPE, GQA/MLA, QK-Norm, KV-Cache) and five residual routing and structural variants (`polymath`, `standard`, `attn_res`, `delta_attn_res`, `openmythos_rdt`), directory map, data processing pipeline, and usage commands.
 
 ---
 
@@ -21,7 +21,7 @@ This document provides a comprehensive guide to the `polymath` codebase for deve
 4. **QK-Norm, SwiGLU & Sparse MoE FFN:**
    * **QK-Norm:** Applies RMSNorm independently to `Q` and `K` prior to computing attention dot products, eliminating attention logit explosions in ultra-deep models.
    * **SwiGLU FFN (`ffn_type: swiglu`):** Replaces standard ReLU/GELU MLPs with gated `SiLU` projections: $\text{FFN}(x) = (w_1(x) \odot \text{SiLU}(w_2(x))) w_3$.
-   * **Sparse MoE FFN (`ffn_type: moe`):** Combines 1 always-active Shared Expert (`shared_expert`) with $N$ routed experts (`routed_experts`), dynamically dispatching each token to top-$k$ (`n_experts_per_tok`) experts.
+
 
 ---
 
@@ -46,7 +46,7 @@ This document provides a comprehensive guide to the `polymath` codebase for deve
 * **Characteristics:** Solves the "routing collapse" problem of AttnRes where cumulative states become highly redundant. Encourages high-contrast sparse attention routing.
 
 #### Mode 4: PolyMath (`polymath`)
-* **Source:** Unified Architecture merging Anthropic reverse-engineered Mythos / Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA/MoE.
+* **Source:** Unified Architecture merging Anthropic reverse-engineered Mythos / Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA.
 * **Formula:** Combines Loop-Aware AttnRes historical stream mixing (`sources`) across a three-stage `Prelude -> RecurrentBlock -> Coda` pipeline:
   $$u_t = \text{AttnRes}(h_0, h_1, \dots, h_t)$$
   $$\Delta h_t = \text{TransformerBlock}(u_t) + \text{DepthWiseLoRA}(t, u_t)$$
@@ -62,7 +62,7 @@ This document provides a comprehensive guide to the `polymath` codebase for deve
   $$\text{Out} = \text{Coda}(h_{(T)})$$
 * **Characteristics & Critical Features:**
   * **Multi-Latent Attention (MLA):** When `attn_type="mla"`, compresses Key/Value representations into a low-rank latent vector $c_{KV} = W_{DKV}(x) \in \mathbb{R}^{kv\_lora\_rank}$ alongside decoupled RoPE query/key branches ($q_{pe}, k_{pe} \in \mathbb{R}^{qk\_rope\_head\_dim}$). This cuts KV-cache bandwidth requirements by $>80\%$.
-  * **Sparse Mixture of Experts (`MoEFFN`):** When `ffn_type="moe"`, combines 1 always-active Shared Expert (`shared_expert`) with $N$ routed experts (`routed_experts`), activating only the top-$k$ (`n_experts_per_tok`) experts per token via gating probabilities.
+
   * **Depth-Wise LoRA Perturbation (`DepthWiseLoRA`):** Injects step-conditioned low-rank matrices across loop iterations $t \in [0, T-1]$, preventing loop homogenization while maintaining weight-sharing efficiency.
   * **Spectral Radius Stability ($\rho(A) < 1$):** Parameterizes the recurrent contraction matrix $A$ as $A = \text{diag}(\exp(-\text{softplus}(A\_raw)))$. This strictly bounds $\rho(A) \in (0, 1)$, ensuring the LTI recurrence is a contraction mapping that never suffers from hidden-state explosion across arbitrary loop depths.
   * **Adaptive Computation Depth (`--effort`):** Allows dynamic adjustment of loop iterations during generation (`sample.py --effort low|medium|high|xhigh`), giving the model adaptive thinking depth without retraining.
@@ -80,7 +80,7 @@ LLM-learn/
 │   ├── small.yaml              # (~125M params) GPT-3 Small class
 │   ├── medium.yaml             # (~350M params) GPT-3 Medium class
 │   ├── large.yaml              # (~1.5B params) Production <2B model
-│   ├── polymath_tiny.yaml      # (~20M params) PolyMath RDT + MLA + MoE (CPU fast check)
+│   ├── polymath_tiny.yaml      # (~20M params) PolyMath RDT + MLA (CPU fast check)
 │   └── polymath_small.yaml     # (~200M params) PolyMath production preset
 └── polymath/
     ├── __init__.py
@@ -88,7 +88,7 @@ LLM-learn/
     ├── tokenizer.py            # Unified Tokenizer API (CharTokenizer vs Tiktoken BPE)
     ├── prepare_data.py         # mmap binary dataset serializer (train.bin, val.bin)
     ├── dataset.py              # CharDataset & MmapDataset + PyTorch DataLoader integration
-    ├── model.py                # TransformerLM, RoPE, GQA/MLA, MoE, 5 routing modes
+    ├── model.py                # TransformerLM, RoPE, GQA/MLA, 5 routing modes
     ├── train.py                # Distributed training loop (AMP, DDP, GradAccum, GradClip, Resume)
     └── sample.py               # Autoregressive sampling script (`--effort` adaptive depth)
 ```
@@ -116,7 +116,7 @@ PYTHONPATH=polymath uv run python polymath/prepare_data.py --input_file corpus.t
 # Train using a preset YAML configuration on single GPU or CPU
 PYTHONPATH=polymath uv run python polymath/train.py --config configs/small.yaml
 
-# Train PolyMath Unified Architecture with Multi-Latent Attention and MoE
+# Train PolyMath Unified Architecture with Multi-Latent Attention
 PYTHONPATH=polymath uv run python polymath/train.py --config configs/polymath_tiny.yaml
 
 # Override model routing mode and training iterations from CLI
@@ -146,8 +146,7 @@ PYTHONPATH=polymath uv run python polymath/sample.py --checkpoint checkpoints/mo
 | `model.mode` | `str` | `"standard"` | Routing mode: `polymath`, `standard`, `attn_res`, `delta_attn_res`, `openmythos_rdt` |
 | `model.attn_type` | `str` | `"gqa"` | Attention type: `gqa` (Grouped Query) or `mla` (Multi-Latent Attention) |
 | `model.kv_lora_rank` | `int` | `64` | Latent KV compression rank when `attn_type="mla"` |
-| `model.ffn_type` | `str` | `"swiglu"` | FFN block type: `swiglu` or `moe` (Sparse Mixture-of-Experts) |
-| `model.n_experts` | `int` | `4` | Number of routed experts in `MoEFFN` |
+
 | `model.max_loop_iters` | `int` | `6` | Default loop count $T$ for `polymath` / `openmythos_rdt` mode |
 | `model.qk_norm` | `bool` | `True` | Apply RMSNorm to Q and K before dot product |
 | `train.batch_size` | `int` | `32` | Batch size per GPU / worker |

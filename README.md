@@ -1,6 +1,6 @@
 # PolyMath
 
-**Unified ≤2B Architecture merging Anthropic reverse-engineered Mythos/Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA/MoE.**
+**Unified ≤2B Architecture merging Anthropic reverse-engineered Mythos/Fable 5 Recurrent-Depth Loop, Kimi AttnRes, and DeepSeek MLA (Pure Dense FFN).**
 
 Built for personal research, experimentation, and training small-to-medium language models on consumer hardware.
 
@@ -13,7 +13,7 @@ PolyMath unifies the most efficient architectural innovations into a single, hig
 - **Recurrent-Depth Loop (Anthropic Mythos/Fable 5):** Three-stage pipeline (`Prelude -> RecurrentBlock -> Coda`). The recurrent block shares weights and loops iteratively, guaranteeing contraction mapping stability ($\rho(A) \in (0, 1)$) and enabling adaptive computation depth (`--effort`).
 - **Attention Residuals (Kimi/Moonshot AI):** Replaces additive connections with depth-wise content-based attention over historical layer states.
 - **Multi-Latent Attention (DeepSeek):** Joint low-rank KV compression ($c_{KV} \in \mathbb{R}^{\text{kv\_lora\_rank}}$) with decoupled RoPE query/key branches. Cuts KV-cache bandwidth by >80%.
-- **Sparse Mixture-of-Experts (MoE):** 1 always-active shared expert + $N$ routed experts, top-$k$ gating with load-balancing auxiliary loss.
+- **Pure Dense FFN:** Parameter-dense architecture for stable training at <=2B scale without routing collapse.
 - **RoPE & QK-Norm:** Rotary embeddings for long-context extrapolation and pre-attention RMSNorm to prevent logit explosions.
 
 ---
@@ -75,7 +75,6 @@ PYTHONPATH=polymath torchrun --nproc_per_node=4 polymath/train.py --config confi
 Training features:
 - **AMP** (BF16/FP16 autocast + GradScaler)
 - **Gradient accumulation** and **gradient clipping**
-- **MoE auxiliary loss** for load balancing
 - **Spectral radius $\rho(A)$ monitoring**
 
 ### 4. Text Generation
@@ -117,8 +116,6 @@ model:
   attn_type: mla
   kv_lora_rank: 256
   qk_rope_head_dim: 64
-  ffn_type: moe
-  n_experts: 8
 ```
 
 ## Documentation
