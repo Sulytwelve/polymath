@@ -222,6 +222,7 @@ def main():
     optimizer = torch.optim.AdamW(optim_groups, lr=config.train.lr, betas=(0.9, 0.95))
 
     start_step = 1
+    best_val_loss = float('inf')
     # Checkpoint Resume
     if config.train.resume_checkpoint and os.path.exists(config.train.resume_checkpoint):
         if master_process:
@@ -230,6 +231,7 @@ def main():
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_step = checkpoint.get("step", 0) + 1
+        best_val_loss = checkpoint.get("best_val_loss", float('inf'))
         if "rng_state" in checkpoint:
             try:
                 torch.set_rng_state(checkpoint["rng_state"])
@@ -321,23 +323,35 @@ def main():
                 print(tokenizer.decode(generated_ids))
                 print("-------------------------")
 
+                # Check if it's the best validation loss
+                val_loss = losses.get("val", float('inf'))
+                is_best = val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+
                 # Save Checkpoint
                 os.makedirs(config.train.checkpoint_dir, exist_ok=True)
                 ckpt_path = os.path.join(config.train.checkpoint_dir, f"model_{config.model.mode}.pt")
-                torch.save({
+                
+                checkpoint = {
                     "step": step,
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "config": config,
                     "vocab_size": config.model.vocab_size,
-                    "rng_state": torch.get_rng_state()
+                    "rng_state": torch.get_rng_state(),
+                    "best_val_loss": best_val_loss
                 }
-                checkpoint_name = ckpt_path.replace(".pt", f"_step_{step:05d}.pt")
-                torch.save(checkpoint, checkpoint_name)
                 
-                # Also save the 'latest' pointer file for easy resuming
+                # Always save the 'latest' pointer file for easy resuming
                 torch.save(checkpoint, ckpt_path)
-                print(f"Checkpoint saved to {checkpoint_name} and {ckpt_path}")
+                
+                if is_best:
+                    best_ckpt_path = ckpt_path.replace(".pt", "_best.pt")
+                    torch.save(checkpoint, best_ckpt_path)
+                    print(f"New best validation loss ({best_val_loss:.4f})! Checkpoint saved to {best_ckpt_path} and {ckpt_path}")
+                else:
+                    print(f"Checkpoint saved to {ckpt_path}")
 
     if master_process:
         print("Training successfully completed!")
