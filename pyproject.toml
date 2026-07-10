@@ -5,7 +5,9 @@ description = "PolyMath: Unified <=2B Architecture merging Anthropic reverse-eng
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch",
+    "torch==2.11.0",
+    "torchaudio",
+    "torchvision",
     "numpy",
     "tqdm",
     "tiktoken",
@@ -13,9 +15,11 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-rocm"
+url = "https://repo.amd.com/rocm/whl/gfx110X-all/"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+torch = { index = "pytorch-rocm" }
+torchaudio = { index = "pytorch-rocm" }
+torchvision = { index = "pytorch-rocm" }
