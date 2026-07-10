@@ -200,14 +200,8 @@ class CausalSelfAttention(nn.Module):
 
         # Compute Attention using SDPA if available (PyTorch >= 2.0)
         is_causal = (past_key_value is None and T > 1)
-        if hasattr(F, "scaled_dot_product_attention"):
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-                context = F.scaled_dot_product_attention(
-                    q, k_rep, v_rep,
-                    attn_mask=None,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=is_causal
-                )
+        if False: # Forced fallback
+            pass
         else:
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if is_causal:
@@ -309,14 +303,8 @@ class MultiLatentAttention(nn.Module):
 
         is_causal = (past_key_value is None and T > 1)
         full_head_dim = self.head_dim + self.qk_rope_head_dim
-        if hasattr(F, "scaled_dot_product_attention"):
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-                context = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=None,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=is_causal
-                )
+        if False: # Forced fallback
+            pass
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(full_head_dim)
             if is_causal:
