@@ -1,29 +1,31 @@
 # llm_learn: Codebase Reference & Developer Guide
 
-This document provides a comprehensive guide to the `llm_learn` codebase for developers, researchers, and code-reviewing agents. It outlines the project's design philosophy, architectural implementations of modern Transformer components (RoPE, GQA, QK-Norm, KV-Cache) and four residual routing variants (`standard`, `attn_res`, `delta_attn_res`, `mhc`), directory map, data processing pipeline, and usage commands.
+This document provides a comprehensive guide to the `llm_learn` codebase for developers, researchers, and code-reviewing agents. It outlines the project's design philosophy, architectural implementations of modern Transformer components (RoPE, GQA/MLA, QK-Norm, MoEFFN, KV-Cache) and five residual routing and structural variants (`standard`, `attn_res`, `delta_attn_res`, `mhc`, `openmythos_rdt`), directory map, data processing pipeline, and usage commands.
 
 ---
 
 ## 1. Project Overview & Architectural Innovations
 
-`llm_learn` is a production-grade, modular Autoregressive Transformer (GPT-style language model) framework engineered to train small-to-medium language models (**up to 2B parameters**). The framework combines state-of-the-art LLM building blocks with four distinct inter-layer connection and signal routing paradigms:
+`llm_learn` is a production-grade, modular Autoregressive Transformer (GPT-style language model) framework engineered to train small-to-medium language models (**up to 2B parameters**). The framework combines state-of-the-art LLM building blocks with five distinct inter-layer connection and signal routing paradigms:
 
 ### Core Modern Building Blocks (All Modes)
 1. **Rotary Position Embedding (RoPE):**
    * Replaces absolute learned position embeddings (`pos_emb`) with relative position rotations applied directly to query and key vectors (`Q` and `K`).
    * Guarantees long-context extrapolation capability and relative distance invariance across sequence lengths up to `max_seq_len`.
-2. **Grouped Query Attention (GQA):**
-   * Decouples `n_heads` (query heads) from `n_kv_heads` (key/value heads).
-   * When `n_kv_heads < n_heads`, key and value tensors are shared across groups of query heads (`n_rep = n_heads // n_kv_heads`). This dramatically reduces parameter counts in linear KV projections and decreases inference-time KV-Cache memory consumption by $2\times$ to $8\times$.
-3. **KV-Cache Incremental Decoding:**
+2. **Grouped Query Attention (GQA) & Multi-Latent Attention (MLA):**
+   * **GQA (`attn_type: gqa`):** Decouples `n_heads` (query heads) from `n_kv_heads` (key/value heads). When `n_kv_heads < n_heads`, key and value tensors are shared across groups of query heads (`n_rep = n_heads // n_kv_heads`).
+   * **MLA (`attn_type: mla`):** DeepSeek-V2 joint low-rank KV compression ($c_{KV} = W_{DKV}(x) \in \mathbb{R}^{kv\_lora\_rank}$) with decoupled RoPE queries/keys ($q_{pe}, k_{pe} \in \mathbb{R}^{qk\_rope\_head\_dim}$). Reduces KV-Cache bandwidth by $>80\%$.
+3. **KV-Cache Incremental Decoding & Adaptive Depth:**
    * Supports $O(1)$ per-token attention computation during autoregressive generation (`model.generate(..., use_cache=True)`).
-4. **QK-Norm & SwiGLU FFN:**
+   * Supports `--effort` (`low`, `medium`, `high`, `xhigh`) dynamic reasoning loop control for `openmythos_rdt` mode.
+4. **QK-Norm, SwiGLU & Sparse MoE FFN:**
    * **QK-Norm:** Applies RMSNorm independently to `Q` and `K` prior to computing attention dot products, eliminating attention logit explosions in ultra-deep models.
-   * **SwiGLU FFN:** Replaces standard ReLU/GELU MLPs with gated `SiLU` projections: $\text{FFN}(x) = (w_1(x) \odot \text{SiLU}(w_2(x))) w_3$.
+   * **SwiGLU FFN (`ffn_type: swiglu`):** Replaces standard ReLU/GELU MLPs with gated `SiLU` projections: $\text{FFN}(x) = (w_1(x) \odot \text{SiLU}(w_2(x))) w_3$.
+   * **Sparse MoE FFN (`ffn_type: moe`):** Combines 1 always-active Shared Expert (`shared_expert`) with $N$ routed experts (`routed_experts`), dynamically dispatching each token to top-$k$ (`n_experts_per_tok`) experts.
 
 ---
 
-### Four Residual Routing Paradigms
+### Five Residual Routing & Structural Paradigms
 
 #### Mode 1: Standard PreNorm Residuals (`standard`)
 * **Source:** Traditional Transformer architecture ("Attention is All You Need").

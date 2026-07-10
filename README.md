@@ -87,4 +87,6 @@ PYTHONPATH=llm_learn uv run python llm_learn/sample.py \
 ---
 
 ## Documentation
-For in-depth mathematical formulas, code architecture breakdowns, and review guidelines, refer to [`CODEBASE_REFERENCE.md`](CODEBASE_REFERENCE.md).
+All detailed technical documentation, mathematical derivations, reverse engineering notes, and review guidelines are archived in the [`docs/`](docs/) directory:
+- [`docs/CODEBASE_REFERENCE.md`](file:///home/suly/Develop/Sources/LLM-learn/docs/CODEBASE_REFERENCE.md): Full Codebase Reference & Developer Guide (Architectural Innovations, 5 Routing Modes, Directory Map, and Parameters).
+- [`docs/Improve_doc.md`](file:///home/suly/Develop/Sources/LLM-learn/docs/Improve_doc.md): OpenMythos / Fable 5 Reverse Engineering & Academic Proofs (`Prelude->Recurrent->Coda`, MLA, MoE, Depth-wise LoRA, and Spectral Radius stability).
