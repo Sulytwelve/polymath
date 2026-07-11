@@ -10,6 +10,7 @@ dependencies = [
     "tqdm",
     "tiktoken",
     "pyyaml",
+    "tokenizers>=0.19.1",
 ]
 
 [[tool.uv.index]]

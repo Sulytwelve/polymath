@@ -35,10 +35,10 @@ def main():
     # Add byte-level decoder so tokens map back to spaces/newlines correctly
     tokenizer.decoder = ByteLevelDecoder()
     
-    # Setup the trainer to strictly output 4096 tokens
+    # Setup the trainer with 8192 vocab for better Python code coverage
     trainer = BpeTrainer(
-        vocab_size=4096,
-        special_tokens=["<|endoftext|>", "<|unk|>"]
+        vocab_size=8192,
+        special_tokens=["<|endoftext|>", "<|unk|>", "<|pad|>"]
     )
     
     print("Training tokenizer on flytech/python-codes-25k... this may take a minute...")

@@ -165,6 +165,13 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
+        # Pre-computed static causal mask buffer: slice at forward time, zero allocation overhead
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().view(1, 1, max_seq_len, max_seq_len),
+            persistent=False
+        )
+
     def forward(self, x: torch.Tensor, past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache: bool = False) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
@@ -205,8 +212,7 @@ class CausalSelfAttention(nn.Module):
         else:
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if is_causal:
-                mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-                scores = scores.masked_fill(mask, float('-inf'))
+                scores = scores.masked_fill(self.causal_mask[:, :, :T, :T] == False, float('-inf'))
             weights = F.softmax(scores, dim=-1)
             weights = self.attn_dropout(weights)
             context = torch.matmul(weights, v_rep)
@@ -254,6 +260,13 @@ class MultiLatentAttention(nn.Module):
         self.out_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         self.rotary_emb = RotaryEmbedding(qk_rope_head_dim, max_position_embeddings=max_seq_len, base=rope_theta)
         self.attn_dropout = nn.Dropout(dropout)
+
+        # Pre-computed static causal mask buffer
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len)).bool().view(1, 1, max_seq_len, max_seq_len),
+            persistent=False
+        )
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -308,8 +321,7 @@ class MultiLatentAttention(nn.Module):
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(full_head_dim)
             if is_causal:
-                mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-                scores = scores.masked_fill(mask, float('-inf'))
+                scores = scores.masked_fill(self.causal_mask[:, :, :T, :T] == False, float('-inf'))
             weights = F.softmax(scores, dim=-1)
             weights = self.attn_dropout(weights)
             context = torch.matmul(weights, v)

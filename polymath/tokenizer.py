@@ -108,11 +108,48 @@ class TiktokenTokenizer(BaseTokenizer):
         return getattr(self.enc, "eot_token", None)
 
 
+class CustomBPETokenizer(BaseTokenizer):
+    """
+    Custom BPE tokenizer backed by Hugging Face tokenizers library.
+    Loaded from a tokenizer.json file.
+    """
+    def __init__(self, path: str = "configs/tokenizer.json"):
+        try:
+            from tokenizers import Tokenizer
+        except ImportError:
+            raise ImportError("tokenizers is not installed. Please run `uv pip install tokenizers`")
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Tokenizer file {path} not found. Train it first using train_tokenizer.py")
+            
+        self.enc = Tokenizer.from_file(path)
+
+    def encode(self, text: str) -> List[int]:
+        return self.enc.encode(text).ids
+
+    def decode(self, tokens: List[int]) -> str:
+        return self.enc.decode(tokens)
+
+    @property
+    def vocab_size(self) -> int:
+        return self.enc.get_vocab_size()
+
+    @property
+    def eos_token_id(self) -> Optional[int]:
+        return self.enc.token_to_id("<|endoftext|>")
+
+    @property
+    def bos_token_id(self) -> Optional[int]:
+        return self.enc.token_to_id("<|endoftext|>")
+
+
 def get_tokenizer(tokenizer_type: str, encoding_name: str = "cl100k_base", text: Optional[str] = None) -> BaseTokenizer:
     tokenizer_type = tokenizer_type.lower()
     if tokenizer_type == "char":
         return CharTokenizer(text=text)
     elif tokenizer_type == "tiktoken":
         return TiktokenTokenizer(encoding_name=encoding_name)
+    elif tokenizer_type == "custom_bpe":
+        return CustomBPETokenizer(path=encoding_name) # Hack: pass path via encoding_name
     else:
         raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")

@@ -1,4 +1,5 @@
 model:
+  vocab_size: 4096
   d_model: 512
   n_heads: 8
   n_kv_heads: 4
@@ -17,13 +18,13 @@ model:
   uniform_loop_sampling: true
   lora_rank: 32
   qk_norm: true
-  dropout: 0.0
+  dropout: 0.1
 
 train:
-  batch_size: 4
-  gradient_accumulation_steps: 2
-  max_iters: 1000
-  lr: 0.001
+  batch_size: 16
+  gradient_accumulation_steps: 8
+  max_iters: 5000
+  lr: 0.0003
   min_lr: 0.0001
   warmup_iters: 100
   weight_decay: 0.1
@@ -35,8 +36,8 @@ train:
   checkpoint_dir: checkpoints
 
 tokenizer:
-  tokenizer_type: tiktoken
-  tiktoken_encoding: cl100k_base
+  tokenizer_type: custom_bpe
+  tiktoken_encoding: configs/tokenizer.json
 
 data:
   dataset_type: mmap

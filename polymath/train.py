@@ -122,6 +122,8 @@ def estimate_loss(model: nn.Module, train_dataset, val_dataset, config: Config, 
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return out
 
 def main():
@@ -140,7 +142,7 @@ def main():
     parser.add_argument("--n_heads", type=int, default=None, help="Override attention heads.")
     parser.add_argument("--n_kv_heads", type=int, default=None, help="Override GQA key/value heads.")
     parser.add_argument("--n_layers", type=int, default=None, help="Override number of layers.")
-    parser.add_argument("--tokenizer", type=str, default=None, choices=["char", "tiktoken"], help="Override tokenizer type.")
+    parser.add_argument("--tokenizer", type=str, default=None, choices=["char", "tiktoken", "custom_bpe"], help="Override tokenizer type.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt file to resume training from.")
     parser.add_argument("--eval_interval", type=int, default=None, help="Interval for evaluation.")
     parser.add_argument("--compile", action="store_true", help="Compile model using torch.compile.")
@@ -300,7 +302,7 @@ def main():
             tokens_processed = config.train.batch_size * config.train.gradient_accumulation_steps * config.model.max_seq_len * ddp_world_size
             tokens_per_sec = tokens_processed / max(dt, 1e-5) if step > start_step else 0.0
             rho_str = ""
-            if config.model.mode.lower() == "openmythos_rdt":
+            if config.model.mode.lower() in ("openmythos_rdt", "polymath"):
                 rho = raw_model.get_spectral_radius()
                 if rho is not None:
                     rho_str = f" | rho(A): {rho:.4f}"
@@ -315,13 +317,17 @@ def main():
                 # Generate sample text
                 print("--- Sample Generation ---")
                 tokenizer = get_tokenizer(config.tokenizer.tokenizer_type, config.tokenizer.tiktoken_encoding, text=getattr(train_dataset, "text", None))
-                prompt_ids = tokenizer.encode("\nFirst Citizen:\n") if config.tokenizer.tokenizer_type == "char" else tokenizer.encode("First Citizen:\n")
+                prompt_ids = tokenizer.encode("\n# Python function:\n") if config.tokenizer.tokenizer_type == "char" else tokenizer.encode("# Python function:\ndef")
                 if not prompt_ids:
                     prompt_ids = [0]
                 context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
                 generated_ids = raw_model.generate(context, max_new_tokens=60, temperature=0.8, use_cache=True)[0].tolist()
                 print(tokenizer.decode(generated_ids))
                 print("-------------------------")
+                # 强制清理生成阶段产生的碎片化显存，防止后续训练吞吐量暴跌
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
                 # Check if it's the best validation loss
                 val_loss = losses.get("val", float('inf'))
