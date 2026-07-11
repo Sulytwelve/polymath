@@ -19,8 +19,8 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
         dtype = np.uint32
         dtype_name = "uint32"
 
-    print("Streaming dataset nvidia/OpenMathInstruct-1...")
-    dataset = load_dataset('nvidia/OpenMathInstruct-1', split='train', streaming=True)
+    print("Streaming dataset flytech/python-codes-25k...")
+    dataset = load_dataset('flytech/python-codes-25k', split='train', streaming=True)
     
     train_bin_path = os.path.join(output_dir, "train.bin")
     val_bin_path = os.path.join(output_dir, "val.bin")
@@ -42,10 +42,10 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
         if sample_count >= max_samples:
             break
             
-        problem = row.get("problem", "")
-        solution = row.get("generated_solution", "")
+        instruction = row.get("instruction", "")
+        output_text = row.get("output", "")
         
-        text = f"Problem:\n{problem}\nSolution:\n{solution}<|endoftext|>"
+        text = f"Instruction: {instruction}\nOutput: {output_text}<|endoftext|>"
         tokens = tokenizer.encode(text)
         
         # Decide if val or train
@@ -88,8 +88,8 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
 def main():
     parser = argparse.ArgumentParser(description="Stream HuggingFace datasets into binary mmap files.")
     parser.add_argument("--output_dir", type=str, default="data", help="Directory to store train.bin and val.bin.")
-    parser.add_argument("--tokenizer", type=str, default="tiktoken", choices=["tiktoken"], help="Tokenizer type.")
-    parser.add_argument("--encoding_name", type=str, default="cl100k_base", help="Tiktoken encoding name.")
+    parser.add_argument("--tokenizer", type=str, default="custom_bpe", choices=["tiktoken", "custom_bpe"], help="Tokenizer type.")
+    parser.add_argument("--encoding_name", type=str, default="configs/tokenizer.json", help="Tiktoken encoding name or path to tokenizer.json.")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation data fraction.")
     parser.add_argument("--max_samples", type=int, default=100000, help="Max samples to stream.")
     args = parser.parse_args()
