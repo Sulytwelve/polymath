@@ -86,6 +86,9 @@ LLM-learn/
     ├── __init__.py
     ├── config.py               # Structured dataclasses (ModelConfig, TrainConfig, DataConfig)
     ├── tokenizer.py            # Unified Tokenizer API (CharTokenizer vs Tiktoken BPE)
+    ├── train_tokenizer.py      # Custom BPE tokenizer trainer (generates tokenizer.json)
+    ├── prepare_code_data.py    # Local code repository concatenator (creates raw txt corpus)
+    ├── prepare_hf_data.py      # HuggingFace datasets downloader and concatenator
     ├── prepare_data.py         # mmap binary dataset serializer (train.bin, val.bin)
     ├── dataset.py              # CharDataset & MmapDataset + PyTorch DataLoader integration
     ├── model.py                # TransformerLM, RoPE, GQA/MLA, 5 routing modes
@@ -97,11 +100,20 @@ LLM-learn/
 
 ## 3. Training & Data Pipeline
 
-### Step 1: Data Preprocessing (`prepare_data.py`)
-Instead of loading entire text files into RAM during training, `prepare_data.py` tokenizes large text corpora using `tiktoken` (`cl100k_base` or `o200k_base`) and writes `numpy.memmap` binary files (`train.bin`, `val.bin`) to disk using `uint16` or `uint32` storage:
+### Step 1: Data Preprocessing
+Data preparation is handled by a suite of scripts depending on the data source:
+
+1. **Fetch & Format Data:**
+   - `prepare_code_data.py`: Recursively scans local code repositories and outputs a concatenated `corpus.txt`.
+   - `prepare_hf_data.py`: Downloads code datasets from HuggingFace (e.g., `HuggingFaceTB/smollm-corpus`) and formats them into `corpus.txt`.
+2. **Train Tokenizer:**
+   - `train_tokenizer.py`: Trains a custom Byte-Level BPE tokenizer on `corpus.txt`, saving the optimized vocabulary to `configs/tokenizer.json`.
+3. **Mmap Serialization:**
+   - `prepare_data.py`: Tokenizes `corpus.txt` using the custom tokenizer (or tiktoken) and writes `numpy.memmap` binary files (`train.bin`, `val.bin`) to disk for zero-overhead memory-mapped loading during training.
+
 ```bash
-# Tokenize a custom text dataset into data/train.bin and data/val.bin
-PYTHONPATH=polymath uv run python polymath/prepare_data.py --input_file corpus.txt --output_dir data --tokenizer tiktoken --encoding_name cl100k_base
+# Tokenize a custom text dataset into data/train.bin and data/val.bin using custom tokenizer
+PYTHONPATH=polymath uv run python polymath/prepare_data.py --input_file corpus.txt --output_dir data --tokenizer custom --encoding_name configs/tokenizer.json
 ```
 
 ### Step 2: Training (`train.py`)
