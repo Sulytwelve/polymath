@@ -5,7 +5,7 @@ import numpy as np
 from datasets import load_dataset
 from tokenizer import get_tokenizer
 
-def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = "tiktoken", encoding_name: str = "cl100k_base", val_ratio: float = 0.1):
+def process_hf_dataset(output_dir: str, dataset_name: str, max_samples: int, tokenizer_type: str = "tiktoken", encoding_name: str = "cl100k_base", val_ratio: float = 0.1):
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"Initializing {tokenizer_type} tokenizer...")
@@ -19,8 +19,8 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
         dtype = np.uint32
         dtype_name = "uint32"
 
-    print("Streaming dataset flytech/python-codes-25k...")
-    dataset = load_dataset('flytech/python-codes-25k', split='train', streaming=True)
+    print(f"Streaming dataset {dataset_name}...")
+    dataset = load_dataset(dataset_name, split='train', streaming=True)
     
     train_bin_path = os.path.join(output_dir, "train.bin")
     val_bin_path = os.path.join(output_dir, "val.bin")
@@ -42,10 +42,13 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
         if sample_count >= max_samples:
             break
             
-        instruction = row.get("instruction", "")
-        output_text = row.get("output", "")
-        
-        text = f"Instruction: {instruction}\nOutput: {output_text}<|endoftext|>"
+        if "code" in row:
+            text = row["code"] + "<|endoftext|>"
+        elif "instruction" in row and "output" in row:
+            text = f"Instruction: {row['instruction']}\nOutput: {row['output']}<|endoftext|>"
+        else:
+            text = str(row) + "<|endoftext|>"
+            
         tokens = tokenizer.encode(text)
         
         # Decide if val or train
@@ -87,15 +90,17 @@ def process_hf_dataset(output_dir: str, max_samples: int, tokenizer_type: str = 
 
 def main():
     parser = argparse.ArgumentParser(description="Stream HuggingFace datasets into binary mmap files.")
-    parser.add_argument("--output_dir", type=str, default="data", help="Directory to store train.bin and val.bin.")
+    parser.add_argument("--dataset_name", type=str, default="ajibawa-2023/Python-Code-Large", help="HuggingFace dataset name.")
+    parser.add_argument("--output_dir", type=str, default="data_large", help="Directory to store train.bin and val.bin.")
     parser.add_argument("--tokenizer", type=str, default="custom_bpe", choices=["tiktoken", "custom_bpe"], help="Tokenizer type.")
     parser.add_argument("--encoding_name", type=str, default="configs/tokenizer.json", help="Tiktoken encoding name or path to tokenizer.json.")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation data fraction.")
-    parser.add_argument("--max_samples", type=int, default=100000, help="Max samples to stream.")
+    parser.add_argument("--val_ratio", type=float, default=0.01, help="Validation data fraction.")
+    parser.add_argument("--max_samples", type=int, default=2000000, help="Max samples to stream.")
     args = parser.parse_args()
 
     process_hf_dataset(
         output_dir=args.output_dir,
+        dataset_name=args.dataset_name,
         max_samples=args.max_samples,
         tokenizer_type=args.tokenizer,
         encoding_name=args.encoding_name,

@@ -392,7 +392,7 @@ class RecurrentBlock(nn.Module):
         self.use_activation_checkpointing = False
 
         # Parameterize stable diagonal contraction matrix A: diag(exp(-softplus(A_raw)))
-        self.A_diag_raw = nn.Parameter(torch.ones(config.d_model) * 0.5)
+        self.A_diag_raw = nn.Parameter(torch.ones(config.d_model) * 1.0)
         # Input injection matrix B
         self.B_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         # Loop-conditioned LoRA
@@ -508,27 +508,25 @@ class TransformerDecoderBlock(nn.Module):
                 return out, sources, present_kv
 
         elif self.mode == 'polymath':
-            if sources is not None and len(sources) > 0:
+            if self.skip_residual:
+                # ★ RecurrentBlock 内部：禁用 AttnRes，保护谱半径约束 rho(A) < 1
+                # AttnRes 的无衰减全历史聚合会绕过 A 矩阵的衰减约束，导致 Loss 震荡与模式坍缩
+                attn_out, present_kv = self.attn(self.norm1(state), past_key_value=past_key_value, use_cache=use_cache)
+                ffn_out = self.ffn(self.norm2(attn_out))
+                return attn_out + ffn_out, sources, present_kv
+            elif sources is not None and len(sources) > 0:
+                # Prelude/Coda blocks: AttnRes 全局特征融合
                 stacked_sources1 = torch.stack(sources, dim=0)
                 u1 = self.attn_res1(stacked_sources1)
                 attn_out, present_kv = self.attn(self.norm1(u1), past_key_value=past_key_value, use_cache=use_cache)
-                if self.skip_residual:
-                    # Inside RecurrentBlock: return delta after AttnRes historical mixing
-                    sources.append(u1 + attn_out)
-                    stacked_sources2 = torch.stack(sources, dim=0)
-                    u2 = self.attn_res2(stacked_sources2)
-                    ffn_out = self.ffn(self.norm2(u2))
-                    return attn_out + ffn_out, sources, present_kv
-                else:
-                    # Prelude/Coda blocks: append intermediate residuals and return updated state
-                    h1 = u1 + attn_out
-                    sources.append(h1)
-                    stacked_sources2 = torch.stack(sources, dim=0)
-                    u2 = self.attn_res2(stacked_sources2)
-                    ffn_out = self.ffn(self.norm2(u2))
-                    out = u2 + ffn_out
-                    sources.append(out)
-                    return out, sources, present_kv
+                h1 = u1 + attn_out
+                sources.append(h1)
+                stacked_sources2 = torch.stack(sources, dim=0)
+                u2 = self.attn_res2(stacked_sources2)
+                ffn_out = self.ffn(self.norm2(u2))
+                out = u2 + ffn_out
+                sources.append(out)
+                return out, sources, present_kv
             else:
                 # Fallback when sources is not initialized
                 attn_out, present_kv = self.attn(self.norm1(state), past_key_value=past_key_value, use_cache=use_cache)

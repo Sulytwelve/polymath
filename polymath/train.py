@@ -232,7 +232,7 @@ def main():
         checkpoint = torch.load(config.train.resume_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_step = checkpoint.get("step", 0) + 1
+        start_step = 1 # FORCED RESET for Phase 2: ignore checkpoint.get("step", 0) + 1
         best_val_loss = checkpoint.get("best_val_loss", float('inf'))
         if "rng_state" in checkpoint:
             try:

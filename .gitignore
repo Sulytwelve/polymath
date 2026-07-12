@@ -25,3 +25,4 @@ wheels/
 *.bin
 data/
 checkpoints/
+data_large/
