@@ -7,9 +7,9 @@ from train import DEFAULT_CORPUS
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text using fast KV-Cache from a trained Transformer checkpoint.")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/model_standard.pt", help="Path to model checkpoint.")
-    parser.add_argument("--prompt", type=str, default="First Citizen:\n", help="Starting text prompt.")
-    parser.add_argument("--num_tokens", type=int, default=200, help="Number of tokens to generate.")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/model_polymath_best.pt", help="Path to model checkpoint.")
+    parser.add_argument("--prompt", type=str, default="def ", help="Starting text prompt.")
+    parser.add_argument("--num_tokens", type=int, default=512, help="Number of tokens to generate.")
     parser.add_argument("--temp", type=float, default=0.8, help="Sampling temperature.")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k filtering limit.")
     parser.add_argument("--effort", type=str, default="high", choices=["low", "medium", "high", "xhigh"], help="Adaptive computation depth effort for openmythos_rdt mode.")
