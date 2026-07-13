@@ -751,6 +751,7 @@ class TransformerLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None,
+                 top_p: float = 1.0, repetition_penalty: float = 1.0,
                  use_cache: bool = True, effort: str = "high") -> torch.Tensor:
         """
         Autoregressive text generation using fast KV-cache decoding ($O(T)$ step cost).
@@ -776,10 +777,28 @@ class TransformerLM(nn.Module):
             else:
                 logits = self(idx_cond, use_cache=False, n_loops=n_loops)
 
-            logits = logits[:, -1, :] / max(temperature, 1e-5)
+            logits = logits[:, -1, :]
+            
+            # Repetition penalty
+            if repetition_penalty != 1.0:
+                score = torch.gather(logits, 1, idx)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                logits.scatter_(1, idx, score)
+
+            logits = logits / max(temperature, 1e-5)
+            
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('inf')
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('inf')
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

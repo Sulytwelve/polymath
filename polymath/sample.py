@@ -12,6 +12,8 @@ def main():
     parser.add_argument("--num_tokens", type=int, default=512, help="Number of tokens to generate.")
     parser.add_argument("--temp", type=float, default=0.8, help="Sampling temperature.")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k filtering limit.")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) filtering limit.")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty factor.")
     parser.add_argument("--effort", type=str, default="high", choices=["low", "medium", "high", "xhigh"], help="Adaptive computation depth effort for openmythos_rdt mode.")
     parser.add_argument("--no_cache", action="store_true", help="Disable KV-Cache decoding (fallback to O(T^2) recomputation).")
     args = parser.parse_args()
@@ -65,6 +67,8 @@ def main():
         max_new_tokens=args.num_tokens,
         temperature=args.temp,
         top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
         use_cache=use_cache,
         effort=args.effort
     )[0].tolist()
